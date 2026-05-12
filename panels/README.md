@@ -1,5 +1,7 @@
 # Panel manifests
 
+[English](./README.md) | [中文文档](./README-ZH.md)
+
 A panel manifest bundles per-model SQLite outputs from one or more `runs/<run_id>/`
 directories into a single virtual evaluation slate. `scripts/build_panel_analysis.py`
 reads the manifest, materialises a `runs/<panel_dir>/` whose shape matches a normal
