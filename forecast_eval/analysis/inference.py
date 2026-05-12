@@ -576,6 +576,7 @@ def pairwise_metric_bootstrap(
     *,
     n_bootstrap: int = 5000,
     seed: int = 42,
+    ci_alpha: float = 0.05,
 ) -> list[MetricBootstrapResult]:
     """For every (metric, ordered model pair), run `metric_paired_bootstrap`.
 
@@ -602,10 +603,159 @@ def pairwise_metric_bootstrap(
                     model_b=mb,
                     n_bootstrap=n_bootstrap,
                     seed=seed,
+                    ci_alpha=ci_alpha,
                 )
                 if res is not None:
                     out.append(res)
     return out
+
+
+@dataclass(frozen=True)
+class SingleMetricBootstrapResult:
+    """Output of `metric_single_bootstrap`. Same shape as PairedBootstrapResult
+    but for a single-model single-variable bootstrap on a panel-level metric.
+    """
+
+    metric_name: str
+    model: str
+    point: float
+    ci_low: float
+    ci_high: float
+    n_questions: int
+    n_bootstrap: int
+
+
+def metric_single_bootstrap(
+    metric_fn: MetricFn,
+    samples_by_q: dict[str, list[SampleRow]],
+    gt_map: dict[str, frozenset[str]],
+    *,
+    metric_name: str,
+    model: str = "M",
+    n_bootstrap: int = 5000,
+    seed: int = 20260512,
+    ci_alpha: float = 0.05,
+) -> SingleMetricBootstrapResult | None:
+    """Single-variable bootstrap CI for a panel-level metric.
+
+    Resamples question ids with replacement `B` times, evaluates
+    `metric_fn` on each resampled panel, and returns a percentile CI on
+    the resulting distribution. Required for non-linear metrics (composite,
+    Cohen kappa, Fleiss kappa, FSS) where `mean over per-question values`
+    does NOT equal the panel-level metric.
+    """
+    common = sorted(samples_by_q.keys())
+    if not common:
+        return None
+    full_gt = {q: gt_map[q] for q in common if q in gt_map}
+    full_samples = {q: samples_by_q[q] for q in common}
+    point = metric_fn(full_samples, full_gt)
+    if point is None:
+        return None
+
+    rng = random.Random(seed)
+    n = len(common)
+    bootstrap_values: list[float] = []
+    for _ in range(n_bootstrap):
+        idxs = [rng.randrange(n) for _ in range(n)]
+        sub_qids = [common[i] for i in idxs]
+        sub_samples, sub_gt = _bootstrap_subset(samples_by_q, gt_map, sub_qids)
+        v = metric_fn(sub_samples, sub_gt)
+        if v is None:
+            continue
+        bootstrap_values.append(v)
+
+    if not bootstrap_values:
+        return None
+    sorted_values = sorted(bootstrap_values)
+    n_b = len(sorted_values)
+    lo_idx = max(0, int(ci_alpha / 2 * n_b))
+    hi_idx = min(n_b - 1, int((1 - ci_alpha / 2) * n_b) - 1)
+    return SingleMetricBootstrapResult(
+        metric_name=metric_name,
+        model=model,
+        point=point,
+        ci_low=sorted_values[lo_idx],
+        ci_high=sorted_values[hi_idx],
+        n_questions=n,
+        n_bootstrap=n_b,
+    )
+
+
+@dataclass(frozen=True)
+class MetricPairwiseSignificance:
+    """Extends `MetricBootstrapResult` with Holm-adjusted p and the
+    bootstrap posterior P(A > B). Holm is applied within each metric's
+    family of `C(n, 2)` pairs; `posterior_a_better` is derived from the
+    two-sided p and the sign of the observed delta.
+    """
+
+    metric: str
+    model_a: str
+    model_b: str
+    n_questions: int
+    delta_mean: float
+    ci_low: float
+    ci_high: float
+    p_raw: float
+    p_holm: float
+    cohens_d: float
+    posterior_a_better: float
+    sig_holm_05: bool
+
+
+def pairwise_metric_significance(
+    samples_by_model_by_q: dict[str, dict[str, list[SampleRow]]],
+    gt_map: dict[str, frozenset[str]],
+    metric_fns: dict[str, MetricFn],
+    *,
+    n_bootstrap: int = 5000,
+    seed: int = 20260512,
+    ci_alpha: float = 0.05,
+) -> list["MetricPairwiseSignificance"]:
+    """Run `pairwise_metric_bootstrap` and then Holm-correct per metric family.
+
+    `posterior_a_better` is the fraction of bootstrap iterations where
+    delta > 0 — semantically `P(A > B | observed)` under the bootstrap.
+    We derive it from `p_two_sided` and the sign of `delta_mean`: when
+    delta_mean > 0, posterior = 1 - p_two/2; when delta_mean < 0,
+    posterior = p_two/2. This matches the bootstrap relation
+    `p_two_sided = 2 * min(P(d<=0), P(d>=0))` for real-valued metrics.
+    """
+    raw = pairwise_metric_bootstrap(
+        samples_by_model_by_q, gt_map, metric_fns,
+        n_bootstrap=n_bootstrap, seed=seed, ci_alpha=ci_alpha,
+    )
+
+    out: list[MetricPairwiseSignificance] = []
+    by_metric: dict[str, list[MetricBootstrapResult]] = {}
+    for r in raw:
+        by_metric.setdefault(r.metric_name, []).append(r)
+
+    for metric, results in by_metric.items():
+        p_raws = [r.p_two_sided for r in results]
+        p_holms = holm_bonferroni(p_raws)
+        for r, p_holm in zip(results, p_holms):
+            if r.delta_mean >= 0:
+                posterior_a_better = 1.0 - r.p_two_sided / 2.0
+            else:
+                posterior_a_better = r.p_two_sided / 2.0
+            out.append(MetricPairwiseSignificance(
+                metric=metric,
+                model_a=r.model_a,
+                model_b=r.model_b,
+                n_questions=r.n_questions,
+                delta_mean=r.delta_mean,
+                ci_low=r.ci_low,
+                ci_high=r.ci_high,
+                p_raw=r.p_two_sided,
+                p_holm=p_holm,
+                cohens_d=r.cohens_d,
+                posterior_a_better=posterior_a_better,
+                sig_holm_05=(p_holm < 0.05),
+            ))
+
+    return sorted(out, key=lambda r: (r.metric, r.model_a, r.model_b))
 
 
 # --------------------------------------------------------------------------- #
@@ -663,36 +813,62 @@ def _metric_fn_acc(
     samples_by_q: dict[str, list[SampleRow]],
     gt_map: dict[str, frozenset[str]],
 ) -> float | None:
-    """Per-sample pass@1 (`Aggregate.pass_at_1_avg`)."""
-    from .accuracy import _aggregate
+    """Per-sample pass@1 (matches `Aggregate.pass_at_1_avg`).
 
+    Direct sample-level computation; equivalent to running `_aggregate`
+    and reading `pass_at_1_avg` but 50-100x faster on bootstrap subsets
+    because it skips the 16-field Aggregate build.
+    """
     if not samples_by_q:
         return None
-    flat = _flatten_with_dict_key_as_qid(samples_by_q)
-    if not flat:
+    total = 0
+    correct = 0
+    for samples in samples_by_q.values():
+        for s in samples:
+            if not s.is_resolvable:
+                continue
+            total += 1
+            if s.correct == 1:
+                correct += 1
+    if total == 0:
         return None
-    sampling_n = _max_sampling_n(samples_by_q)
-    agg = _aggregate(flat, sampling_n=sampling_n, gt_map=gt_map)
-    return agg.pass_at_1_avg
+    return correct / total
 
 
 def _metric_fn_mv_acc(
     samples_by_q: dict[str, list[SampleRow]],
     gt_map: dict[str, frozenset[str]],
 ) -> float | None:
-    """Majority-vote accuracy. Returns None when sampling_n < 2 (no MV signal)."""
-    from .accuracy import _aggregate
+    """Majority-vote accuracy. Returns None when sampling_n < 2 (no MV signal).
+
+    Direct equivalent of `Aggregate.majority_vote_accuracy`.
+    """
+    from collections import Counter
 
     if not samples_by_q:
         return None
     sampling_n = _max_sampling_n(samples_by_q)
     if sampling_n < 2:
         return None
-    flat = _flatten_with_dict_key_as_qid(samples_by_q)
-    if not flat:
+    hits: list[int] = []
+    for qid, samples in samples_by_q.items():
+        if not samples:
+            continue
+        gt = gt_map.get(qid)
+        if gt is None:
+            continue
+        parsed = [s.parsed_letters for s in samples if s.is_eligible and s.parsed_letters is not None]
+        if not parsed:
+            continue
+        counts = Counter(parsed)
+        top_count = max(counts.values())
+        winners = [k for k, v in counts.items() if v == top_count]
+        if len(winners) != 1:
+            continue
+        hits.append(1 if winners[0] == gt else 0)
+    if not hits:
         return None
-    agg = _aggregate(flat, sampling_n=sampling_n, gt_map=gt_map)
-    return agg.majority_vote_accuracy
+    return sum(hits) / len(hits)
 
 
 def _metric_fn_fleiss_kappa(
@@ -742,14 +918,198 @@ def _metric_fn_ebi(
     return brier_index(bs_values)
 
 
+def _metric_fn_pass_any(
+    samples_by_q: dict[str, list[SampleRow]],
+    gt_map: dict[str, frozenset[str]],
+) -> float | None:
+    """OR over trials of per-trial correctness, averaged over questions.
+
+    Direct equivalent of `Aggregate.pass_any_at_n`.
+    """
+    if not samples_by_q:
+        return None
+    hits: list[int] = []
+    for samples in samples_by_q.values():
+        rs = [s for s in samples if s.is_resolvable]
+        if not rs:
+            continue
+        hits.append(1 if any(s.correct == 1 for s in rs) else 0)
+    if not hits:
+        return None
+    return sum(hits) / len(hits)
+
+
+def _metric_fn_pass_all(
+    samples_by_q: dict[str, list[SampleRow]],
+    gt_map: dict[str, frozenset[str]],
+) -> float | None:
+    """AND over trials of per-trial correctness, averaged over questions.
+
+    Direct equivalent of `Aggregate.at_least_all_at_n` — counts a
+    question as `1` only when ALL `sampling_n` trials were resolvable and
+    correct (so a partial-resolvable question scores 0).
+    """
+    if not samples_by_q:
+        return None
+    sampling_n = _max_sampling_n(samples_by_q)
+    hits: list[int] = []
+    for samples in samples_by_q.values():
+        rs = [s for s in samples if s.is_resolvable]
+        if not rs:
+            continue
+        n_rs = len(rs)
+        n_correct = sum(1 for s in rs if s.correct == 1)
+        hits.append(1 if (n_rs == sampling_n and n_correct == n_rs) else 0)
+    if not hits:
+        return None
+    return sum(hits) / len(hits)
+
+
+def _metric_fn_pass_at_1(
+    samples_by_q: dict[str, list[SampleRow]],
+    gt_map: dict[str, frozenset[str]],
+) -> float | None:
+    """Strict-equality pass@1 averaged over questions (alias of `acc`).
+
+    Kept as a named registry entry so the panel-level pairwise paired
+    bootstrap can emit a row with `metric=pass_at_1` under its conventional
+    name, without renaming the existing `acc` slot consumed elsewhere.
+    """
+    if not samples_by_q:
+        return None
+    return _metric_fn_acc(samples_by_q, gt_map)
+
+
+def _metric_fn_cohen_kappa(
+    samples_by_q: dict[str, list[SampleRow]],
+    gt_map: dict[str, frozenset[str]],
+) -> float | None:
+    """Cohen's κ on per-sample correct/wrong outcomes.
+
+    Delegates to `accuracy.cohen_kappa`, which already accepts the
+    `(samples_by_q, gt_map)` shape used by the bootstrap pipeline.
+    """
+    from .accuracy import cohen_kappa
+
+    if not samples_by_q:
+        return None
+    return cohen_kappa(samples_by_q, gt_map)
+
+
+def _metric_fn_composite_factory(
+    composite_weights: dict[str, float],
+) -> MetricFn:
+    """Build a composite MetricFn closed over a 3-bucket weight dict.
+
+    `composite_weights` keys are `{"binary", "mc-single", "mc-multi"}`;
+    values sum to ~1. Per question, computes the mean `exam_score` over
+    eligible samples (in-base only), groups by `(question_type,
+    choice_type)` into the 3 buckets, averages within each bucket, then
+    takes the weighted mean across buckets — denominator drops buckets
+    that contribute zero usable questions. Driven by `composite_weights`
+    from the panel manifest; the code-side 4-bucket DEFAULT_WEIGHTS in
+    `composite.py` remains a distinct contract knob untouched by this
+    metric.
+    """
+    from .exam_score import exam_score
+
+    expected_buckets = ("binary", "mc-single", "mc-multi")
+    if set(composite_weights.keys()) != set(expected_buckets):
+        raise ValueError(
+            f"composite_weights keys must be {set(expected_buckets)}; "
+            f"got {set(composite_weights.keys())}"
+        )
+
+    def _bucket_of_sample(s: SampleRow) -> str | None:
+        if s.question_type in ("yes_no", "binary_named"):
+            return "binary"
+        if s.question_type == "multiple_choice":
+            if s.choice_type == "single":
+                return "mc-single"
+            if s.choice_type == "multi":
+                return "mc-multi"
+        return None
+
+    def _fn(
+        samples_by_q: dict[str, list[SampleRow]],
+        gt_map: dict[str, frozenset[str]],
+    ) -> float | None:
+        if not samples_by_q:
+            return None
+        per_bucket_e_q: dict[str, list[float]] = {b: [] for b in expected_buckets}
+        for qid, ss in samples_by_q.items():
+            gt = gt_map.get(qid)
+            if gt is None or not ss:
+                continue
+            bucket = _bucket_of_sample(ss[0])
+            if bucket is None:
+                continue
+            per_sample_scores: list[float] = []
+            for s in ss:
+                v = exam_score(s, gt)
+                if v is None:
+                    continue
+                per_sample_scores.append(v)
+            if not per_sample_scores:
+                continue
+            per_bucket_e_q[bucket].append(
+                sum(per_sample_scores) / len(per_sample_scores)
+            )
+        total_w = 0.0
+        total_v = 0.0
+        for bucket, w in composite_weights.items():
+            arr = per_bucket_e_q.get(bucket, [])
+            if not arr:
+                continue
+            total_w += w
+            total_v += w * (sum(arr) / len(arr))
+        if total_w <= 0:
+            return None
+        return total_v / total_w
+
+    return _fn
+
+
+def build_default_metric_fns(
+    *,
+    composite_weights: dict[str, float] | None = None,
+) -> dict[str, MetricFn]:
+    """Build the full metric registry for panel-aware paths.
+
+    Returns the legacy 5-metric `DEFAULT_METRIC_FNS` plus the four extra
+    bootstrap metrics (pass_at_1, cohen_kappa, pass_any, pass_all). Pass
+    `composite_weights` to add the 3-bucket composite under panel-manifest
+    weights; omit it to leave composite out of the registry.
+    """
+    out = dict(DEFAULT_METRIC_FNS)
+    out.update(_EXTRA_METRIC_FNS)
+    if composite_weights is not None:
+        out["composite"] = _metric_fn_composite_factory(composite_weights)
+    return out
+
+
 # Public registry for `pairwise_metric_bootstrap`. Keys become the
-# `metric` column in `pairwise_bootstrap.csv`.
+# `metric` column in `pairwise_bootstrap.csv`. Held to the original
+# 5-metric set so the legacy non-panel analysis path keeps writing the
+# same `pairwise_bootstrap.csv` schema; the 4 additional metrics
+# (pass_at_1, cohen_kappa, pass_any, pass_all) and the composite metric
+# enter the registry via `build_default_metric_fns()` and flow only
+# through the panel-aware path.
 DEFAULT_METRIC_FNS: dict[str, MetricFn] = {
     "fss": _metric_fn_fss,
     "acc": _metric_fn_acc,
     "mv_acc": _metric_fn_mv_acc,
     "fleiss_kappa": _metric_fn_fleiss_kappa,
     "ebi": _metric_fn_ebi,
+}
+
+
+# Internal: extra metrics surfaced only through `build_default_metric_fns`.
+_EXTRA_METRIC_FNS: dict[str, MetricFn] = {
+    "pass_at_1": _metric_fn_pass_at_1,
+    "cohen_kappa": _metric_fn_cohen_kappa,
+    "pass_any": _metric_fn_pass_any,
+    "pass_all": _metric_fn_pass_all,
 }
 
 
@@ -771,4 +1131,9 @@ __all__ = [
     "pairwise_metric_bootstrap",
     "cohens_d_from_bootstrap",
     "DEFAULT_METRIC_FNS",
+    "build_default_metric_fns",
+    "MetricPairwiseSignificance",
+    "pairwise_metric_significance",
+    "SingleMetricBootstrapResult",
+    "metric_single_bootstrap",
 ]
