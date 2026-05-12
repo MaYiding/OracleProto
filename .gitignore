@@ -106,6 +106,8 @@ openspec/
 tavily_doc/
 papers/
 repository_doc/
+docs/superpowers/
+panels/
 CLAUDE.md
 Agent.md
 DESIGN.md
