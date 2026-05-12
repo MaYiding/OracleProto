@@ -148,6 +148,8 @@ composite, …) is recomputed by `forecast_eval/analysis/`, which runs at the en
 python -m forecast_eval.analysis runs/{run_id}
 ```
 
+When the run is a virtual panel (`manifest.is_virtual_panel = true`), the analysis path additionally emits the panel-wide statistical envelope. See [`panels/README.md`](./panels/README.md) for the field-by-field schema and [`panels/example.json`](./panels/example.json) for a 2-model template.
+
 ---
 
 ## 5. Contact

@@ -1141,11 +1141,122 @@ def _write_grid_winrate_csv(
     return _write_csv(path, header, out_rows)
 
 
+def _write_per_model_ci_csv(path, rows):
+    """Long-form per-(model, metric) CI table for the panel statistical
+    envelope. Columns: model, metric, point, ci_lo, ci_hi, ci_half_width,
+    n_questions. Rows are `PerModelCI` dataclass instances.
+    """
+    header = ["model", "metric", "point", "ci_lo", "ci_hi", "ci_half_width", "n_questions"]
+    out_rows = []
+    for r in rows:
+        out_rows.append([
+            r.model, r.metric,
+            _round(r.point), _round(r.ci_lo), _round(r.ci_hi),
+            _round(r.ci_half_width), r.n_questions,
+        ])
+    return _write_csv(path, header, out_rows)
+
+
+def _write_multi_comparison_sensitivity_csv(path, sensitivity_by_metric):
+    """Holm vs BH sensitivity. Columns: metric, n_pairs, both, holm_only,
+    bh_only, neither. `sensitivity_by_metric` is `{metric: {category: int}}`.
+    """
+    header = ["metric", "n_pairs", "both", "holm_only", "bh_only", "neither"]
+    out_rows = []
+    for metric in sorted(sensitivity_by_metric.keys()):
+        cats = sensitivity_by_metric[metric]
+        total = cats["both"] + cats["holm_only"] + cats["bh_only"] + cats["neither"]
+        out_rows.append([
+            metric, total,
+            cats["both"], cats["holm_only"], cats["bh_only"], cats["neither"],
+        ])
+    return _write_csv(path, header, out_rows)
+
+
+def _write_within_family_pairs_csv(path, rows, family_map):
+    """Long-form within-family pairwise significance rows. Columns:
+    family, metric, model_a, model_b, delta_mean, ci_low, ci_high,
+    p_holm, cohens_d, sig_holm_05. Rows are MetricPairwiseSignificance
+    filtered to in-family pairs.
+    """
+    header = [
+        "family", "metric", "model_a", "model_b",
+        "delta_mean", "ci_low", "ci_high",
+        "p_holm", "cohens_d", "sig_holm_05",
+    ]
+    out_rows = []
+    for r in rows:
+        fam = family_map.get(r.model_a) or family_map.get(r.model_b) or "?"
+        out_rows.append([
+            fam, r.metric, r.model_a, r.model_b,
+            _round(r.delta_mean), _round(r.ci_low), _round(r.ci_high),
+            _round(r.p_holm, 4), _round(r.cohens_d), int(r.sig_holm_05),
+        ])
+    return _write_csv(path, header, out_rows)
+
+
+def _write_rank_stability_csv(path, rows):
+    """Per-(metric, model) rank stability. Columns: metric, model,
+    point_rank, median_rank, rank_p05, rank_p95, leader_posterior.
+    """
+    header = ["metric", "model", "point_rank", "median_rank", "rank_p05", "rank_p95", "leader_posterior"]
+    out_rows = []
+    for r in rows:
+        out_rows.append([
+            r.metric, r.model, r.point_rank, r.median_rank,
+            r.rank_p05, r.rank_p95, _round(r.leader_posterior, 4),
+        ])
+    return _write_csv(path, header, out_rows)
+
+
+def _write_rank_stability_summary_json(path, summary_by_metric):
+    """Write `{metric: {kendall_tau_*: float}}`."""
+    import json as _json
+    with open(path, "w") as f:
+        _json.dump(
+            {k: dict(v) for k, v in summary_by_metric.items()},
+            f, indent=2, sort_keys=True,
+        )
+    return path
+
+
+def _write_metric_pairwise_significance_csv(path, rows):
+    """Headline pairwise paired bootstrap with Holm-adjusted p and posterior
+    P(A > B). Columns: metric, model_a, model_b, n_questions, delta_mean,
+    ci_low, ci_high, p_raw, p_holm, cohens_d, posterior_a_better,
+    sig_holm_05. Rows are `MetricPairwiseSignificance` dataclasses.
+
+    Separate from the BI-domain `pairwise_significance.csv` writer above
+    — the two carry different schemas and downstream consumers.
+    """
+    header = [
+        "metric", "model_a", "model_b", "n_questions",
+        "delta_mean", "ci_low", "ci_high",
+        "p_raw", "p_holm", "cohens_d", "posterior_a_better", "sig_holm_05",
+    ]
+    out_rows = []
+    for r in rows:
+        out_rows.append([
+            r.metric, r.model_a, r.model_b, r.n_questions,
+            _round(r.delta_mean), _round(r.ci_low), _round(r.ci_high),
+            _round(r.p_raw, 4), _round(r.p_holm, 4),
+            _round(r.cohens_d), _round(r.posterior_a_better, 4),
+            int(r.sig_holm_05),
+        ])
+    return _write_csv(path, header, out_rows)
+
+
 __all__ = [
     "_SUMMARY_FIELDS",
     "_DISCRETE_FSS_FIELDS",
     "_CONSISTENCY_FIELDS",
     "_write_csv",
+    "_write_per_model_ci_csv",
+    "_write_metric_pairwise_significance_csv",
+    "_write_rank_stability_csv",
+    "_write_rank_stability_summary_json",
+    "_write_within_family_pairs_csv",
+    "_write_multi_comparison_sensitivity_csv",
     "_write_per_model_summary_csv",
     "_write_slice_csv",
     "_write_per_model_composite_csv",
