@@ -1,0 +1,34 @@
+{
+  "panel_id": "example",
+  "created": "2026-01-01",
+  "bootstrap_seed": 12345,
+  "bootstrap_iterations": 5000,
+  "ci_alpha": 0.05,
+  "composite_weights": {
+    "binary": 0.30,
+    "mc-single": 0.50,
+    "mc-multi": 0.20
+  },
+  "families": {
+    "vendor_a": ["model-a::r5::c4"],
+    "vendor_b": ["model-b::r5::c4"]
+  },
+  "models": [
+    {
+      "display_label": "Model A",
+      "virtual_slug": "model-a::r5::c4",
+      "source_run_id": "20260101-000000-aaaa",
+      "db_filename": "model-a__r5__c4.db",
+      "family": "vendor_a",
+      "training_cutoff": "2025-12-01"
+    },
+    {
+      "display_label": "Model B",
+      "virtual_slug": "model-b::r5::c4",
+      "source_run_id": "20260101-000000-bbbb",
+      "db_filename": "model-b__r5__c4.db",
+      "family": "vendor_b",
+      "training_cutoff": "2025-11-15"
+    }
+  ]
+}

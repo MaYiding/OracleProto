@@ -107,7 +107,11 @@ tavily_doc/
 papers/
 repository_doc/
 docs/superpowers/
-panels/
+# Local panel manifests: each evaluator bundles their own slate.
+# The schema is documented in panels/README.md + panels/example.json,
+# both of which ARE tracked.
+panels/*.json
+!panels/example.json
 CLAUDE.md
 Agent.md
 DESIGN.md
