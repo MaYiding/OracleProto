@@ -140,6 +140,8 @@ DB 仅存原始观测。每一项聚合（$`\text{pass@1}`$、FSS、BI、composi
 python -m forecast_eval.analysis runs/{run_id}
 ```
 
+当运行是虚拟 panel（`manifest.is_virtual_panel = true`），analysis 路径额外产出 panel-wide 统计资料：`analysis/per_model_ci.csv`（逐 (model, metric) $`95\%`$ paired bootstrap CI）、`analysis/metric_pairwise_significance.csv`（$`\binom{N}{2}`$ 对 paired $`\Delta`$ 加 Holm-adjusted $`p`$、Cohen's $`d`$、bootstrap 后验 $`\Pr(A>B)`$）、`analysis/rank_stability.csv`（leader 后验 $`\Pr(\text{rank}_M=1)`$ 与 bootstrap rank 分布）、`analysis/within_family_pairs.csv`、`analysis/multi_comparison_sensitivity.csv`（Holm 与 Benjamini–Hochberg 对照）。`panels/<panel_id>.json` 与 `scripts/build_panel_analysis.py` 一起把跨 source run 的逐 model DB 物化成虚拟 panel 目录。
+
 ---
 
 ## 5. 联系与合作

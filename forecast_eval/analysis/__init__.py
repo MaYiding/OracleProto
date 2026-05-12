@@ -494,7 +494,13 @@ def run_analysis(
     # EBI. Skips metrics that return None on the data (e.g. EBI on
     # legacy fixtures, Fleiss κ on K=1).
     # ------------------------------------------------------------------ #
-    if len(samples_by_model_by_q) >= 2:
+    is_panel = bool(manifest.get("is_virtual_panel"))
+    if len(samples_by_model_by_q) >= 2 and not is_panel:
+        # Legacy single-run pairwise: skipped on virtual panels because the
+        # panel-aware block below produces a strictly richer table
+        # (`metric_pairwise_significance.csv`) and the legacy call's 5-metric
+        # x C(18,2) x 5000-iteration cost is duplicate work that adds 10+ min
+        # on the 18-model panel without surfacing new information.
         metric_results = pairwise_metric_bootstrap(
             samples_by_model_by_q, gt_map_global, DEFAULT_METRIC_FNS,
         )
@@ -503,6 +509,242 @@ def run_analysis(
                 analysis_dir / "pairwise_bootstrap.csv",
                 metric_results,
             ))
+
+    if len(samples_by_model_by_q) >= 2:
+        # ------------------------------------------------------------------ #
+        # Panel-aware statistical envelope: per-(model, metric) CI, pairwise
+        # Holm + posterior, rank stability, within-family, BH sensitivity.
+        # Gated on `is_virtual_panel` so non-panel runs are untouched.
+        # ------------------------------------------------------------------ #
+        if is_panel:
+            from .inference import (
+                build_default_metric_fns,
+                metric_single_bootstrap,
+                pairwise_metric_significance,
+            )
+            from .per_model_ci import PerModelCI
+            from .rank_stability import rank_stability_panel
+            from .within_family import filter_significance_to_within_family
+            from .fdr_bh import benjamini_hochberg, compare_holm_vs_bh
+            from .writers import (
+                _write_per_model_ci_csv,
+                _write_metric_pairwise_significance_csv,
+                _write_rank_stability_csv,
+                _write_rank_stability_summary_json,
+                _write_within_family_pairs_csv,
+                _write_multi_comparison_sensitivity_csv,
+            )
+
+            composite_weights = manifest.get("composite_weights")
+            bootstrap_seed = int(manifest.get("bootstrap_seed", 20260512))
+            n_bootstrap = int(manifest.get("bootstrap_iterations", 5000))
+            ci_alpha = float(manifest.get("ci_alpha", 0.05))
+            composite_source = "manifest" if composite_weights else "settings_default"
+
+            full_metric_fns = build_default_metric_fns(
+                composite_weights=composite_weights,
+            )
+            # Eight panel-wide metrics: composite + 4 headline
+            # (pass_at_1 / cohen_kappa / fss / mv_acc) + 4 non-headline
+            # (pass_any / pass_all / fleiss_kappa). `acc` is omitted
+            # because `pass_at_1` is its alias; `acc` is reused below
+            # for the 3 question-type-restricted sub-panels.
+            panel_metric_names = [
+                "composite",
+                "pass_at_1", "cohen_kappa", "fss",
+                "mv_acc", "pass_any", "pass_all", "fleiss_kappa",
+            ]
+            panel_metric_fns = {
+                k: full_metric_fns[k] for k in panel_metric_names if k in full_metric_fns
+            }
+
+            # ---- Per-(model, metric) CI (panel-wide metrics) ----
+            # Use metric_single_bootstrap (panel-level resampling) rather
+            # than mean-over-per-q-values, because the headline metrics
+            # are non-linear (composite is a bucket-weighted average;
+            # Cohen / Fleiss kappa apply chance correction; FSS uses a
+            # chance baseline). Per-q mean only matches panel value for
+            # truly linear metrics like pass_at_1 / pass_any / pass_all.
+            per_model_ci_rows: list[PerModelCI] = []
+            for metric_name in sorted(panel_metric_fns.keys()):
+                fn = panel_metric_fns[metric_name]
+                for model in sorted(samples_by_model_by_q.keys()):
+                    sbq = samples_by_model_by_q[model]
+                    common = {q: sbq[q] for q in sbq if q in gt_map_global}
+                    if not common:
+                        continue
+                    res = metric_single_bootstrap(
+                        fn, common, gt_map_global,
+                        metric_name=metric_name, model=model,
+                        n_bootstrap=n_bootstrap, seed=bootstrap_seed,
+                        ci_alpha=ci_alpha,
+                    )
+                    if res is None:
+                        continue
+                    per_model_ci_rows.append(PerModelCI(
+                        model=res.model, metric=res.metric_name,
+                        point=res.point,
+                        ci_lo=res.ci_low, ci_hi=res.ci_high,
+                        ci_half_width=(res.ci_high - res.ci_low) / 2.0,
+                        n_questions=res.n_questions,
+                    ))
+
+            # ---- Pairwise significance (panel-wide metrics) ----
+            significance_rows = list(pairwise_metric_significance(
+                samples_by_model_by_q, gt_map_global, panel_metric_fns,
+                n_bootstrap=n_bootstrap, seed=bootstrap_seed, ci_alpha=ci_alpha,
+            ))
+
+            # ---- Bucket slicing: acc on 3 question-type sub-panels ----
+            # The 3 buckets are: Binary (yes_no + binary_named),
+            # MC-Single (multiple_choice + choice_type=single), and
+            # MC-Multi (multiple_choice + choice_type=multi).
+            bucket_of_qid: dict[str, str | None] = {}
+            for _model, _sbq in samples_by_model_by_q.items():
+                for _qid, _ss in _sbq.items():
+                    if not _ss or _qid in bucket_of_qid:
+                        continue
+                    s0 = _ss[0]
+                    if s0.question_type in ("yes_no", "binary_named"):
+                        bucket_of_qid[_qid] = "binary"
+                    elif s0.question_type == "multiple_choice":
+                        if s0.choice_type == "single":
+                            bucket_of_qid[_qid] = "mc_single"
+                        elif s0.choice_type == "multi":
+                            bucket_of_qid[_qid] = "mc_multi"
+                        else:
+                            bucket_of_qid[_qid] = None
+                    else:
+                        bucket_of_qid[_qid] = None
+            bucket_to_qids: dict[str, set[str]] = {}
+            for _qid, _b in bucket_of_qid.items():
+                if _b is None:
+                    continue
+                bucket_to_qids.setdefault(_b, set()).add(_qid)
+
+            acc_subpanels = {
+                "acc_binary": bucket_to_qids.get("binary", set()),
+                "acc_mc_single": bucket_to_qids.get("mc_single", set()),
+                "acc_mc_multi": bucket_to_qids.get("mc_multi", set()),
+            }
+            for bucket_key, qids in acc_subpanels.items():
+                if not qids:
+                    continue
+                sub_samples = {
+                    model: {q: sbq[q] for q in qids if q in sbq}
+                    for model, sbq in samples_by_model_by_q.items()
+                }
+                sub_gt = {q: gt_map_global[q] for q in qids if q in gt_map_global}
+                bucket_metric_fns = {bucket_key: full_metric_fns["acc"]}
+                bucket_sig = pairwise_metric_significance(
+                    sub_samples, sub_gt, bucket_metric_fns,
+                    n_bootstrap=n_bootstrap, seed=bootstrap_seed, ci_alpha=ci_alpha,
+                )
+                significance_rows.extend(bucket_sig)
+
+                # Per-(model, bucket_key) CI rows via panel-level bootstrap.
+                # acc is linear (per-q correctness average), so mean-of-q
+                # would equal panel value, but we use metric_single_bootstrap
+                # uniformly to share the same code path with the non-linear
+                # headline metrics above.
+                for model in sorted(sub_samples.keys()):
+                    sbq = sub_samples[model]
+                    common_bucket = {q: sbq[q] for q in sbq if q in sub_gt}
+                    if not common_bucket:
+                        continue
+                    res = metric_single_bootstrap(
+                        full_metric_fns["acc"], common_bucket, sub_gt,
+                        metric_name=bucket_key, model=model,
+                        n_bootstrap=n_bootstrap, seed=bootstrap_seed,
+                        ci_alpha=ci_alpha,
+                    )
+                    if res is None:
+                        continue
+                    per_model_ci_rows.append(PerModelCI(
+                        model=res.model, metric=res.metric_name,
+                        point=res.point,
+                        ci_lo=res.ci_low, ci_hi=res.ci_high,
+                        ci_half_width=(res.ci_high - res.ci_low) / 2.0,
+                        n_questions=res.n_questions,
+                    ))
+
+            if per_model_ci_rows:
+                written.append(_write_per_model_ci_csv(
+                    analysis_dir / "per_model_ci.csv",
+                    per_model_ci_rows,
+                ))
+            if significance_rows:
+                written.append(_write_metric_pairwise_significance_csv(
+                    analysis_dir / "metric_pairwise_significance.csv",
+                    significance_rows,
+                ))
+
+            # ---- Rank stability across 5 metrics via panel-level bootstrap ----
+            rank_metrics = ["composite", "pass_at_1", "fss", "cohen_kappa", "fleiss_kappa"]
+            rank_rows_all = []
+            rank_summary_all: dict = {}
+            for metric_name in rank_metrics:
+                if metric_name not in panel_metric_fns:
+                    continue
+                fn = panel_metric_fns[metric_name]
+                rows, summary = rank_stability_panel(
+                    samples_by_model_by_q, gt_map_global, fn,
+                    metric_name=metric_name,
+                    seed=bootstrap_seed, n_bootstrap=n_bootstrap,
+                )
+                if rows:
+                    rank_rows_all.extend(rows)
+                    rank_summary_all[metric_name] = summary
+            if rank_rows_all:
+                written.append(_write_rank_stability_csv(
+                    analysis_dir / "rank_stability.csv", rank_rows_all,
+                ))
+                written.append(_write_rank_stability_summary_json(
+                    analysis_dir / "rank_stability_summary.json",
+                    rank_summary_all,
+                ))
+
+            # ---- Within-family pairs (P3) ----
+            family_map = manifest.get("model_family_map", {})
+            if family_map and significance_rows:
+                wf_rows = filter_significance_to_within_family(significance_rows, family_map)
+                if wf_rows:
+                    written.append(_write_within_family_pairs_csv(
+                        analysis_dir / "within_family_pairs.csv",
+                        wf_rows, family_map,
+                    ))
+
+            # ---- Multi-comparison sensitivity (P5) ----
+            if significance_rows:
+                sens_by_metric: dict = {}
+                by_metric: dict = {}
+                for r in significance_rows:
+                    by_metric.setdefault(r.metric, []).append(r)
+                for metric, rs in by_metric.items():
+                    p_holm_list = [r.p_holm for r in rs]
+                    p_raw_list = [r.p_raw for r in rs]
+                    p_bh_list = benjamini_hochberg(p_raw_list)
+                    sens_by_metric[metric] = compare_holm_vs_bh(
+                        p_holm_list, p_bh_list, alpha=ci_alpha,
+                    )
+                written.append(_write_multi_comparison_sensitivity_csv(
+                    analysis_dir / "multi_comparison_sensitivity.csv",
+                    sens_by_metric,
+                ))
+
+            # ---- analysis_meta stamp ----
+            analysis_meta_path = analysis_dir / "analysis_meta.json"
+            meta = {}
+            if analysis_meta_path.exists():
+                meta = json.loads(analysis_meta_path.read_text())
+            meta.update({
+                "bootstrap_seed": bootstrap_seed,
+                "bootstrap_iterations": n_bootstrap,
+                "ci_alpha": ci_alpha,
+                "composite_weights_source": composite_source,
+                "panel_metric_set": panel_metric_names,
+            })
+            analysis_meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True))
 
     # ------------------------------------------------------------------ #
     # Probabilistic deliverables — kept as companion outputs; calibration
