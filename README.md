@@ -148,7 +148,7 @@ composite, …) is recomputed by `forecast_eval/analysis/`, which runs at the en
 python -m forecast_eval.analysis runs/{run_id}
 ```
 
-When the run is a virtual panel (`manifest.is_virtual_panel = true`), the analysis path additionally emits the panel-wide statistical envelope: `analysis/per_model_ci.csv` (per-(model, metric) $`95\%`$ paired bootstrap CI), `analysis/metric_pairwise_significance.csv` ($`\binom{N}{2}`$ paired $`\Delta`$ with Holm-adjusted $`p`$, Cohen's $`d`$, and bootstrap posterior $`\Pr(A>B)`$), `analysis/rank_stability.csv` (leader posterior $`\Pr(\text{rank}_M=1)`$ and bootstrap rank distribution), `analysis/within_family_pairs.csv`, and `analysis/multi_comparison_sensitivity.csv` (Holm vs Benjamini–Hochberg). The panel manifest in `panels/<panel_id>.json` and `scripts/build_panel_analysis.py` together produce the input directory by aggregating per-model DBs across source runs. See [`panels/README.md`](./panels/README.md) for the field-by-field schema and [`panels/example.json`](./panels/example.json) for a 2-model template.
+When the run is a virtual panel (`manifest.is_virtual_panel = true`), the analysis path additionally emits the panel-wide statistical envelope. See [`panels/README.md`](./panels/README.md) for the field-by-field schema and [`panels/example.json`](./panels/example.json) for a 2-model template.
 
 ---
 
