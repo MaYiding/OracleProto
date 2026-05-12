@@ -9,9 +9,6 @@ manifest，物化出形如普通 run 的 `runs/<panel_dir>/`（`manifest.json` +
 （逐 (model, metric) bootstrap CI、pairwise 显著性、rank 稳定性、家族内
 paired Δ、Holm vs Benjamini–Hochberg 敏感性）。
 
-每位评测者各自打包自己的 slate，因此 manifest 文件**不被 git 追踪**。
-权威 schema 见 `panels/example.json`；本文件逐字段说明，让你能自己写一份。
-
 ## 字段说明
 
 ### 顶层字段

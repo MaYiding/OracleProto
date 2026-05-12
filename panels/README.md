@@ -9,10 +9,6 @@ run (`manifest.json` + `db/*.db`), and `forecast_eval.analysis` then emits the
 panel-wide statistical envelope (per-(model, metric) bootstrap CI, pairwise
 significance, rank stability, within-family pairs, Holm-vs-BH sensitivity).
 
-Each evaluator bundles their own slate, so manifest files are **not tracked**
-by git. The canonical schema is `panels/example.json`; this README documents
-every field so you can write your own.
-
 ## Field reference
 
 ### Top-level
