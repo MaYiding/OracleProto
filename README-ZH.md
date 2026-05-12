@@ -140,7 +140,7 @@ DB 仅存原始观测。每一项聚合（$`\text{pass@1}`$、FSS、BI、composi
 python -m forecast_eval.analysis runs/{run_id}
 ```
 
-当运行是虚拟 panel（`manifest.is_virtual_panel = true`），analysis 路径额外产出 panel-wide 统计资料。字段级 schema 见 [`panels/README.md`](./panels/README.md)，最小可工作骨架见 [`panels/example.json`](./panels/example.json)。
+当运行是虚拟 panel（`manifest.is_virtual_panel = true`），analysis 路径额外产出 panel-wide 统计资料。字段级 schema 见 [`panels/README.md`](./panels/README-ZH.md)，最小可工作骨架见 [`panels/example.json`](./panels/example.json)。
 
 ---
 
