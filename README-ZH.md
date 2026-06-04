@@ -120,7 +120,7 @@ python evaluation.py
 
 ## 3. 接入自有数据集
 
-仓库随附 `forecast_eval_set_example.db`，包含 80 道人工精选的问题，覆盖三种题型，日期跨越 2026-03-12 至 2026-04-14。若要接入其他语料，仅需替换 `.env` 中的 `SOURCE_DB` 与 `SOURCE_TABLE`。
+仓库随附 `forecast_eval_set_example.db`，包含 312 道清洗后的问题，覆盖三种题型，日期跨越 2026-03-19 至 2026-05-26。若要接入其他语料，仅需替换 `.env` 中的 `SOURCE_DB` 与 `SOURCE_TABLE`。
 
 ---
 

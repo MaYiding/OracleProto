@@ -124,8 +124,8 @@ retry under the original backoff policy.
 
 ## 3. Bring your own dataset
 
-The bundled `forecast_eval_set_example.db` carries 80 curated questions across
-three question types, with dates spanning 2026-03-12 to 2026-04-14. To plug in
+The bundled `forecast_eval_set_example.db` carries 312 cleaned questions across
+three question types, with dates spanning 2026-03-19 to 2026-05-26. To plug in
 another corpus, swap `SOURCE_DB` and `SOURCE_TABLE` in `.env`.
 
 ---

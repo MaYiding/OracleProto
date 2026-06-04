@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .db import utcnow_iso, connect as db_connect
+from .prompts import DEFAULT_PROMPT_TEMPLATES
 from .types import QFilter, Question
 
 
@@ -22,7 +23,23 @@ _REQUIRED_TEMPLATE_KEYS = (
 )
 
 
+def _default_features() -> dict[str, Any]:
+    return {
+        "prompt_reconstruction": dict(DEFAULT_PROMPT_TEMPLATES),
+    }
+
+
+def _source_has_table(src_conn: sqlite3.Connection, table: str) -> bool:
+    row = src_conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
 def _read_features_json(src_conn: sqlite3.Connection) -> dict[str, Any]:
+    if not _source_has_table(src_conn, "dataset_metadata"):
+        return _default_features()
     row = src_conn.execute("SELECT features_json FROM dataset_metadata").fetchone()
     if row is None:
         raise ValueError(
@@ -35,7 +52,7 @@ def sync_prompt_templates(
     source_db: str | Path,
     results_conn: sqlite3.Connection,
 ) -> dict[str, str]:
-    """Flatten `dataset_metadata.features_json.prompt_reconstruction` into
+    """Flatten source prompt templates into
     `results.db.prompt_templates` and return it as a dict for in-memory use.
 
     String fields are stored verbatim; nested (dict/list) values are JSON-serialised
@@ -78,7 +95,7 @@ def sync_questions(
     source_db: str | Path,
     results_conn: sqlite3.Connection,
     filters: QFilter,
-    table: str = "forecast_eval_set_example",
+    table: str = "test_cases",
 ) -> list[Question]:
     """Copy the filtered question rows from `<source_db>.<table>` into
     `results.db.questions`.
@@ -144,6 +161,8 @@ def load_raw_features_json(source_db: str | Path) -> str:
     """Return the raw `features_json` string for metadata hashing."""
     src = db_connect(source_db)
     try:
+        if not _source_has_table(src, "dataset_metadata"):
+            return json.dumps(_default_features(), ensure_ascii=False, sort_keys=True)
         row = src.execute("SELECT features_json FROM dataset_metadata").fetchone()
     finally:
         src.close()
