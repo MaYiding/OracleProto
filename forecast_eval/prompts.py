@@ -5,6 +5,61 @@ import json
 from .types import Question
 
 
+DEFAULT_PROMPT_TEMPLATES: dict[str, str] = {
+    "agent_role": "You are an agent that can predict future events.",
+    "guidance": (
+        "Do not use any other format. Do not refuse to make a prediction. "
+        'Do not say "I cannot predict the future." You must make a clear '
+        "prediction based on the best data currently available, using the box "
+        "format specified above."
+    ),
+    "yes_no_output_format": (
+        "Your task is to predict whether the event will occur based on your analysis.\n"
+        "Your prediction will be scored based on its accuracy. You will only receive "
+        "points if your answer is correct.\n"
+        "Your final answer MUST end with this exact format:\n"
+        "\\boxed{Yes} or \\boxed{No}"
+    ),
+    "binary_named_output_format": (
+        "Your task is to predict which of the two outcomes will occur based on your analysis.\n"
+        "Your prediction will be scored based on its accuracy. You will only receive "
+        "points if your answer is correct.\n"
+        "Your final answer MUST end with this exact format:\n"
+        "\\boxed{<options[0]>} or \\boxed{<options[1]>}"
+    ),
+    "prompt_template": (
+        '{agent_role} The event to be predicted: "{event} '
+        '(resolved around {end_time} (GMT+8)).{outcomes_block}"\n\n'
+        "IMPORTANT: Your final answer MUST end with this exact format:\n"
+        "{output_format}\n"
+        "{guidance}"
+    ),
+    "outcomes_block_rule": (
+        "Empty for yes_no/binary_named. For multiple_choice: '\\n' + "
+        "'A. <label>\\nB. <label>\\n...' built from options."
+    ),
+    "multiple_choice_single_output_format": (
+        "This is a SINGLE-ANSWER question: exactly ONE of the listed options is correct.\n"
+        "Your prediction will be scored on strict equality with the unique correct "
+        "letter; choosing the wrong letter, or selecting more than one letter, scores zero.\n"
+        "Your final answer MUST end with this exact format:\n"
+        "the single correct letter inside the box, e.g. \\boxed{A}.\n"
+        "Do NOT list more than one letter, even if you believe two outcomes are tied "
+        "\u2014 pick the one you find most likely."
+    ),
+    "multiple_choice_multi_output_format": (
+        "This is a MULTI-SELECT question: ONE OR MORE of the listed options can be correct.\n"
+        "Your prediction will be scored on strict equality with the FULL set of correct "
+        "letters: any extra letter, any missing letter, or any wrong letter scores zero. "
+        "You must include ALL correct options and NO incorrect options.\n"
+        "Your final answer MUST end with this exact format:\n"
+        "listing all correct option(s) you have identified, separated by commas, within the box.\n"
+        "For example: \\boxed{A} for a single correct option, or \\boxed{B, C} "
+        "for multiple correct options."
+    ),
+}
+
+
 # Lowercase / symbolic labels are easily eaten by markdown (backticks /
 # underscores / asterisks). With >26 options the labels land on `[`, `\`, `]`,
 # `^`, `_`, `` ` ``, `a`, `b`, ... so we uniformly wrap any non-A-Z label in
@@ -14,9 +69,8 @@ _BACKTICK_SAFE_ASCII_RANGE = set(range(ord("A"), ord("Z") + 1))
 
 
 # Reflection protocol. Appended as a tail paragraph to the user message; it is
-# NOT part of dataset_metadata.prompt_reconstruction (so prompt_templates_hash
-# is unaffected) but is persisted in the user_prompt field so the run is fully
-# reproducible.
+# NOT part of prompt_templates (so prompt_templates_hash is unaffected) but is
+# persisted in the user_prompt field so the run is fully reproducible.
 # Design goal: use prompt engineering to pull the model from "1 web_search and
 # answer directly" to ">=3 distinct angles + reflection after each + opposite-
 # direction self-check", driven mostly by the protocol itself rather than a
@@ -454,7 +508,7 @@ def render_user_prompt(
 ) -> str:
     """Assemble the single user message handed to the LLM for one sample.
 
-    All template text lives in `templates` (synced from dataset_metadata). This
+    All template text lives in `templates` (synced by the loader). This
     function only branches on `q.question_type` and handles the three
     rendering rules from the prompt-rendering spec.
 

@@ -440,9 +440,9 @@ class Settings(BaseSettings):
     # Database
     SOURCE_DB: str = "./forecast_eval_set_example.db"
     # Question table inside SOURCE_DB. The bundled example DB ships with
-    # `forecast_eval_set_example`; bring-your-own datasets can point at any other
+    # `test_cases`; bring-your-own datasets can point at any other
     # table name as long as it has the same 7-column schema (see FRAME.md §2.1).
-    SOURCE_TABLE: str = "forecast_eval_set_example"
+    SOURCE_TABLE: str = "test_cases"
     # Every evaluation gets its own folder at RUNS_ROOT/{run_id}/, containing one
     # SQLite file per model under db/, plus analysis/ (post-run statistics) and
     # logs/. The old single-file RESULTS_DB layout is gone — see FRAME.md §5/§6.
