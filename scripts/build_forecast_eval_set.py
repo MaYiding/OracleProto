@@ -18,6 +18,7 @@ import json
 import re
 import sqlite3
 import sys
+import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -56,6 +57,15 @@ _SPACE_RE = re.compile(r"\s+")
 _OUTCOME_PREFIX_RE = re.compile(
     r"^(?:the\s+)?outcome\s+(?:be|is|will\s+be)\s+",
     re.IGNORECASE,
+)
+_PROMPT_INSTRUCTION_FRAGMENTS = (
+    "IMPORTANT:",
+    "Do not use any other format",
+    "\\boxed",
+    "Your final answer MUST",
+)
+_TRUNCATED_MONTH_DATE_RE = re.compile(
+    r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d$"
 )
 
 
@@ -126,7 +136,12 @@ def _get(record: Mapping[str, Any], *names: str) -> Any:
 def _clean_option_text(text: str) -> str:
     cleaned = _normalise_space(text)
     cleaned = _OUTCOME_PREFIX_RE.sub("", cleaned)
+    cleaned = cleaned.rstrip("\"'\\")
     return _normalise_space(cleaned)
+
+
+def _clean_event_text(text: str) -> str:
+    return _normalise_space(text).rstrip("\"'\\")
 
 
 def _extract_event_from_prompt(prompt: str) -> str:
@@ -236,7 +251,7 @@ def _convert_source_record(
 
     prompt = str(_get(record, "prompt"))
     event_raw = str(_get(record, "title", "event", "question")).strip()
-    event = _normalise_space(event_raw) if event_raw else _extract_event_from_prompt(prompt)
+    event = _clean_event_text(event_raw) if event_raw else _extract_event_from_prompt(prompt)
     if not event:
         raise DatasetBuildError("empty event")
 
@@ -361,6 +376,26 @@ def _validate_question(row: Mapping[str, Any]) -> list[str]:
     if q.question_type == "binary_named" and len(options) != 2:
         errors.append("binary_named must have exactly two options")
 
+    text_fields = [("event", q.event)]
+    text_fields.extend((f"option[{i}]", option) for i, option in enumerate(options))
+    for field, value in text_fields:
+        if value != value.strip():
+            errors.append(f"{field} has outer whitespace")
+        if any(ch in value for ch in "\r\n\t"):
+            errors.append(f"{field} contains control whitespace")
+        if any(fragment in value for fragment in _PROMPT_INSTRUCTION_FRAGMENTS):
+            errors.append(f"{field} contains prompt instruction text")
+        if "\\" in value:
+            errors.append(f"{field} contains a backslash escape marker")
+        if any(unicodedata.category(ch) in {"Cc", "Cf"} for ch in value):
+            errors.append(f"{field} contains Unicode control or format characters")
+        if value.endswith(('"', "'", "\\")):
+            errors.append(f"{field} ends with a prompt boundary character")
+        if "  " in value:
+            errors.append(f"{field} contains repeated spaces")
+        if _TRUNCATED_MONTH_DATE_RE.search(value):
+            errors.append(f"{field} appears to end with a truncated month date")
+
     try:
         rendered = render_user_prompt(q, DEFAULT_PROMPT_TEMPLATES)
         parsed = parse_answer(f"\\boxed{{{_payload_for_answer(q)}}}", q)
@@ -479,6 +514,10 @@ def build_rows(
             bad.append(ValidationIssue(row_id, str(exc)))
             continue
         if converted is not None:
+            validation_errors = _validate_question(converted)
+            if validation_errors:
+                bad.append(ValidationIssue(row_id, "; ".join(validation_errors)))
+                continue
             rows.append(converted)
 
     if bad and not allow_drop_bad:
