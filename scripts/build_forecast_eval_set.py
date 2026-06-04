@@ -1,217 +1,606 @@
-"""Build a curated `forecast_eval_set.db` from `forecast_eval_set_example.db`.
+"""Build `forecast_eval_set_example.db` from futurex-ai/Futurex-Past.
 
 Run from the repo root:
 
-    python scripts/build_forecast_eval_set.py
+    uv run --with pandas --with pyarrow python scripts/build_forecast_eval_set.py
 
-Refuses to overwrite an existing destination DB; delete it manually first
-if you want to regenerate.
-
-Sampling design (target N=90):
-
-* Time floor `end_time >= 2026-03-01` — keeps the recent half of the
-  3-month example span, biasing the curated set toward events that fall
-  after typical model training cutoffs.
-* Stratified by `(question_type, choice_type)` per `QUOTA` below.  The
-  ratios approximate the example DB's overall distribution.
-* Topic diversification for `mc/single` and `yes_no`: cap `TOPIC_CAP=3`
-  per event-prefix (first `PREFIX_LEN` chars, lower-cased).  Prevents
-  one trending topic (Oscars / elections / playoffs) from monopolising
-  the set.  `mc/multi` and `binary_named` keep tiny candidate pools, so
-  they skip the cap.
-* `random.Random(SEED)` makes the output deterministic; bump `SEED` if
-  you want a fresh sample.
-* Output table is `forecast_eval_set` (no `_example` suffix), with the
-  same 7-column schema + 3 indexes + a `dataset_metadata` row.  `.env`
-  consumers switch datasets via `SOURCE_DB` + `SOURCE_TABLE`.
+The script reads the latest parquet shard from Hugging Face, keeps level 1/2
+rows whose resolution date is on or after the configured cutoff, reconstructs
+the seven-column OracleProto question schema, validates every row, and atomically
+replaces the destination database.
 """
 from __future__ import annotations
 
+import argparse
+import ast
 import hashlib
-import random
+import json
+import re
 import sqlite3
 import sys
-from collections import Counter
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence
 
 REPO = Path(__file__).resolve().parent.parent
-SRC_DB = REPO / "forecast_eval_set_example.db"
-SRC_TABLE = "forecast_eval_set_example"
-DST_DB = REPO / "forecast_eval_set.db"
-DST_TABLE = "forecast_eval_set"
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 
-TIME_FLOOR = "2026-03-01"
-QUOTA = {
-    ("multiple_choice", "single"): 50,
-    ("yes_no", "single"): 25,
-    ("multiple_choice", "multi"): 10,
-    ("binary_named", "single"): 5,
-}
-TOPIC_CAP = 3
-PREFIX_LEN = 50
-TOPIC_CAP_STRATA = {("multiple_choice", "single"), ("yes_no", "single")}
-SEED = 42
+from forecast_eval.parser import parse_answer, parse_gt
+from forecast_eval.prompts import (
+    DEFAULT_PROMPT_TEMPLATES,
+    index_to_letter,
+    letter_to_index,
+    render_user_prompt,
+)
+from forecast_eval.types import Question
 
 
-def main() -> None:
-    if not SRC_DB.exists():
-        print(f"source DB missing: {SRC_DB}", file=sys.stderr)
-        sys.exit(1)
-    if DST_DB.exists():
-        print(f"refusing to overwrite existing {DST_DB}", file=sys.stderr)
-        sys.exit(1)
+DEFAULT_SOURCE_PARQUET = (
+    "https://huggingface.co/datasets/futurex-ai/Futurex-Past/resolve/main/"
+    "data/train-00000-of-00001.parquet"
+)
+DEFAULT_OUTPUT_DB = REPO / "forecast_eval_set_example.db"
+DEFAULT_TABLE = "test_cases"
+DEFAULT_MIN_END_DATE = "2026-03-18"
+DEFAULT_MIN_ROWS = 301
+ALLOWED_LEVELS = frozenset({1, 2})
 
-    src = sqlite3.connect(SRC_DB)
-    src.row_factory = sqlite3.Row
+_OPTION_LINE_RE = re.compile(r"^\s*(?P<label>.)\.\s+(?P<text>.+?)\s*$")
+_EVENT_RE = re.compile(
+    r'The event to be predicted:\s*"(?P<event>[\s\S]*?)\s*'
+    r"\(resolved around\s+[^()]+?\s+\(GMT\+8\)\)\.",
+)
+_SPACE_RE = re.compile(r"\s+")
+_OUTCOME_PREFIX_RE = re.compile(
+    r"^(?:the\s+)?outcome\s+(?:be|is|will\s+be)\s+",
+    re.IGNORECASE,
+)
 
-    rng = random.Random(SEED)
-    selected: list[dict] = []
-    print("=== sampling ===")
-    for (qt, ct), n in QUOTA.items():
-        rows = src.execute(
-            f"SELECT id, choice_type, question_type, event, options, answer, end_time "
-            f"FROM {SRC_TABLE} "
-            f"WHERE question_type=? AND choice_type=? AND end_time >= ? "
-            f"ORDER BY end_time DESC, id",
-            (qt, ct, TIME_FLOOR),
-        ).fetchall()
-        candidates = [dict(r) for r in rows]
 
-        if len(candidates) <= n:
-            picked = candidates
-        elif (qt, ct) in TOPIC_CAP_STRATA:
-            shuffled = list(candidates)
-            rng.shuffle(shuffled)
-            topic_count: Counter = Counter()
-            picked = []
-            for q in shuffled:
-                prefix = q["event"][:PREFIX_LEN].lower().strip()
-                if topic_count[prefix] >= TOPIC_CAP:
-                    continue
-                picked.append(q)
-                topic_count[prefix] += 1
-                if len(picked) >= n:
-                    break
-            if len(picked) < n:
-                picked_ids = {q["id"] for q in picked}
-                for q in shuffled:
-                    if q["id"] in picked_ids:
-                        continue
-                    picked.append(q)
-                    if len(picked) >= n:
-                        break
+@dataclass(frozen=True)
+class ValidationIssue:
+    row_id: str
+    message: str
+
+
+@dataclass(frozen=True)
+class ValidationReport:
+    row_count: int
+    bad_rows: list[ValidationIssue]
+    by_question_type: dict[str, int]
+    by_choice_type: dict[str, int]
+    min_end_time: str | None
+    max_end_time: str | None
+
+
+class DatasetBuildError(RuntimeError):
+    pass
+
+
+def _normalise_space(text: str) -> str:
+    return _SPACE_RE.sub(" ", text).strip()
+
+
+def _normalise_for_match(text: str) -> str:
+    return _normalise_space(text).casefold()
+
+
+def _normalise_date(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if hasattr(value, "to_pydatetime"):
+        return value.to_pydatetime().date().isoformat()
+
+    text = str(value).strip()
+    if not text:
+        raise DatasetBuildError("empty end_time")
+    slash_match = re.match(r"^(\d{4})/(\d{1,2})/(\d{1,2})(?:\s|$)", text)
+    if slash_match:
+        y, m, d = slash_match.groups()
+        return date(int(y), int(m), int(d)).isoformat()
+    if len(text) >= 10:
+        head = text[:10]
+        try:
+            return date.fromisoformat(head).isoformat()
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
+    except ValueError as exc:
+        raise DatasetBuildError(f"cannot parse end_time {text!r}") from exc
+
+
+def _get(record: Mapping[str, Any], *names: str) -> Any:
+    by_lower = {str(k).lower(): k for k in record.keys()}
+    for name in names:
+        key = by_lower.get(name.lower())
+        if key is not None:
+            return record[key]
+    raise DatasetBuildError(f"missing source column; tried {', '.join(names)}")
+
+
+def _clean_option_text(text: str) -> str:
+    cleaned = _normalise_space(text)
+    cleaned = _OUTCOME_PREFIX_RE.sub("", cleaned)
+    return _normalise_space(cleaned)
+
+
+def _extract_event_from_prompt(prompt: str) -> str:
+    match = _EVENT_RE.search(prompt)
+    if not match:
+        raise DatasetBuildError("cannot extract event from prompt")
+    return _normalise_space(match.group("event"))
+
+
+def _parse_options_from_prompt(prompt: str) -> list[str]:
+    options: list[str] = []
+    for line in prompt.splitlines():
+        match = _OPTION_LINE_RE.match(line)
+        if not match:
+            continue
+        expected = index_to_letter(len(options))
+        label = match.group("label")
+        if label != expected:
+            continue
+        option = _clean_option_text(match.group("text"))
+        if not option:
+            raise DatasetBuildError(f"empty option for label {label}")
+        options.append(option)
+    return options
+
+
+def _parse_boxed_options(prompt: str) -> list[str]:
+    values = [v.strip() for v in re.findall(r"\\boxed\{([^}]*)\}", prompt) if v.strip()]
+    out: list[str] = []
+    for value in values:
+        if value not in out:
+            out.append(value)
+    return out
+
+
+def _parse_ground_truth(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        values = list(value)
+    else:
+        text = str(value).strip()
+        try:
+            parsed = ast.literal_eval(text)
+        except (SyntaxError, ValueError):
+            if text.startswith("[") and text.endswith("]"):
+                inner = text[1:-1].strip()
+                values = [p.strip().strip("'\"") for p in inner.split(",") if p.strip()]
+            else:
+                values = [text]
         else:
-            shuffled = list(candidates)
-            rng.shuffle(shuffled)
-            picked = shuffled[:n]
+            values = list(parsed) if isinstance(parsed, (list, tuple)) else [parsed]
 
-        print(f"  {qt}/{ct}: candidates={len(candidates)}, picked={len(picked)}")
-        selected.extend(picked)
+    cleaned = [_normalise_space(str(v).strip().strip("'\"")) for v in values]
+    cleaned = [v for v in cleaned if v]
+    if not cleaned:
+        raise DatasetBuildError("empty ground_truth")
+    return cleaned
 
-    target_total = sum(QUOTA.values())
-    assert len(selected) == target_total, f"got {len(selected)} != target {target_total}"
-    selected.sort(key=lambda q: (q["end_time"], q["id"]))
 
-    src_meta = dict(src.execute("SELECT * FROM dataset_metadata").fetchone())
-    features_json = src_meta["features_json"]
+def _is_letter_for_options(value: str, options: Sequence[str]) -> bool:
+    if len(value) != 1:
+        return False
+    idx = letter_to_index(value)
+    return 0 <= idx < len(options)
 
-    dst = sqlite3.connect(DST_DB)
-    dst.row_factory = sqlite3.Row
-    dst.executescript(
-        f"""
-        CREATE TABLE {DST_TABLE} (
-            id TEXT PRIMARY KEY,
-            choice_type TEXT NOT NULL,
-            question_type TEXT NOT NULL,
-            event TEXT NOT NULL,
-            options TEXT NOT NULL,
-            answer TEXT NOT NULL,
-            end_time TEXT NOT NULL
-        );
-        CREATE INDEX idx_{DST_TABLE}_choice_type ON {DST_TABLE}(choice_type);
-        CREATE INDEX idx_{DST_TABLE}_question_type ON {DST_TABLE}(question_type);
-        CREATE INDEX idx_{DST_TABLE}_end_time ON {DST_TABLE}(end_time);
-        CREATE TABLE dataset_metadata (
-            dataset_name TEXT NOT NULL,
-            split_name TEXT NOT NULL,
-            table_name TEXT NOT NULL,
-            row_count INTEGER NOT NULL,
-            imported_at_utc TEXT NOT NULL,
-            features_json TEXT NOT NULL
-        );
-        """
+
+def _answer_csv(letters: Iterable[str]) -> str:
+    ordered = sorted(set(letters), key=letter_to_index)
+    if not ordered:
+        raise DatasetBuildError("empty answer letter set")
+    return ", ".join(ordered)
+
+
+def _truth_to_letters(truth_values: Sequence[str], options: Sequence[str]) -> list[str]:
+    by_option = {_normalise_for_match(option): index_to_letter(i) for i, option in enumerate(options)}
+    letters: list[str] = []
+    for value in truth_values:
+        if _is_letter_for_options(value, options):
+            letters.append(value)
+            continue
+        matched = by_option.get(_normalise_for_match(value))
+        if matched is None:
+            raise DatasetBuildError(f"ground_truth {value!r} does not match any option")
+        letters.append(matched)
+    return sorted(set(letters), key=letter_to_index)
+
+
+def _truth_to_yes_no_letter(truth_values: Sequence[str]) -> str:
+    if len(truth_values) != 1:
+        raise DatasetBuildError("yes_no question must have exactly one ground_truth value")
+    value = truth_values[0].casefold()
+    if value == "yes":
+        return "A"
+    if value == "no":
+        return "B"
+    raise DatasetBuildError(f"yes_no ground_truth must be Yes or No, got {truth_values[0]!r}")
+
+
+def _convert_source_record(
+    record: Mapping[str, Any],
+    *,
+    min_end_date: str,
+) -> dict[str, str] | None:
+    level = int(_get(record, "level", "Level"))
+    end_time = _normalise_date(_get(record, "end_time", "endTime"))
+    if level not in ALLOWED_LEVELS or end_time < min_end_date:
+        return None
+
+    prompt = str(_get(record, "prompt"))
+    event_raw = str(_get(record, "title", "event", "question")).strip()
+    event = _normalise_space(event_raw) if event_raw else _extract_event_from_prompt(prompt)
+    if not event:
+        raise DatasetBuildError("empty event")
+
+    row_id = _normalise_space(str(_get(record, "id")))
+    if not row_id:
+        raise DatasetBuildError("empty id")
+
+    truth_values = _parse_ground_truth(_get(record, "ground_truth", "answer"))
+    parsed_options = _parse_options_from_prompt(prompt)
+
+    if parsed_options:
+        question_type = "multiple_choice"
+        options = parsed_options
+        answer_letters = _truth_to_letters(truth_values, options)
+    else:
+        boxed_options = _parse_boxed_options(prompt)
+        if {v.casefold() for v in truth_values}.issubset({"yes", "no"}):
+            question_type = "yes_no"
+            options = ["Yes", "No"]
+            answer_letters = [_truth_to_yes_no_letter(truth_values)]
+        elif len(boxed_options) == 2:
+            question_type = "binary_named"
+            options = boxed_options
+            answer_letters = _truth_to_letters(truth_values, options)
+        else:
+            raise DatasetBuildError("no options block and not a yes_no or binary_named prompt")
+
+    if len(options) < 2:
+        raise DatasetBuildError("question must have at least two options")
+    if question_type in {"yes_no", "binary_named"} and len(answer_letters) != 1:
+        raise DatasetBuildError(f"{question_type} question must have one answer")
+
+    choice_type = "multi" if len(answer_letters) > 1 else "single"
+    return {
+        "id": row_id,
+        "choice_type": choice_type,
+        "question_type": question_type,
+        "event": event,
+        "options": json.dumps(options, ensure_ascii=False),
+        "answer": _answer_csv(answer_letters),
+        "end_time": end_time,
+    }
+
+
+def _question_from_row(row: Mapping[str, Any]) -> Question:
+    return Question(
+        id=str(row["id"]),
+        choice_type=str(row["choice_type"]),
+        question_type=str(row["question_type"]),
+        event=str(row["event"]),
+        options=str(row["options"]),
+        answer=str(row["answer"]),
+        end_time=str(row["end_time"]),
     )
 
-    dst.executemany(
-        f"INSERT INTO {DST_TABLE} "
-        f"(id, choice_type, question_type, event, options, answer, end_time) "
-        f"VALUES (?,?,?,?,?,?,?)",
-        [
-            (
-                q["id"],
-                q["choice_type"],
-                q["question_type"],
-                q["event"],
-                q["options"],
-                q["answer"],
-                q["end_time"],
-            )
-            for q in selected
-        ],
-    )
 
-    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    dst.execute(
-        "INSERT INTO dataset_metadata "
-        "(dataset_name, split_name, table_name, row_count, imported_at_utc, features_json) "
-        "VALUES (?,?,?,?,?,?)",
-        (
-            "forecast_eval_set",
-            "train",
-            DST_TABLE,
-            len(selected),
-            now_iso,
-            features_json,
-        ),
-    )
-    dst.commit()
+def _payload_for_answer(q: Question) -> str:
+    gt = parse_gt(q.answer)
+    options = json.loads(q.options)
+    if q.question_type == "yes_no":
+        if gt == frozenset({"A"}):
+            return "Yes"
+        if gt == frozenset({"B"}):
+            return "No"
+        raise DatasetBuildError("yes_no answer must be A or B")
+    if q.question_type == "binary_named":
+        if len(gt) != 1:
+            raise DatasetBuildError("binary_named answer must contain one letter")
+        idx = letter_to_index(next(iter(gt)))
+        return options[idx]
+    return ", ".join(sorted(gt, key=letter_to_index))
 
-    print("\n=== verification ===")
-    total = dst.execute(f"SELECT COUNT(*) FROM {DST_TABLE}").fetchone()[0]
-    print(f"row_count: {total}")
-    for r in dst.execute(
-        f"SELECT question_type, choice_type, COUNT(*) AS n FROM {DST_TABLE} "
-        f"GROUP BY question_type, choice_type ORDER BY question_type, choice_type"
-    ):
-        print(f"  {dict(r)}")
-    rng_row = dict(
-        dst.execute(
-            f"SELECT MIN(end_time) AS mn, MAX(end_time) AS mx, "
-            f"COUNT(DISTINCT end_time) AS days FROM {DST_TABLE}"
-        ).fetchone()
-    )
-    print(f"end_time: min={rng_row['mn']}, max={rng_row['mx']}, distinct_days={rng_row['days']}")
 
-    by_month = dict(
-        dst.execute(
-            f"SELECT substr(end_time,1,7) AS ym, COUNT(*) AS n FROM {DST_TABLE} "
-            f"GROUP BY ym ORDER BY ym"
+def _validate_question(row: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    for field in ("id", "choice_type", "question_type", "event", "options", "answer", "end_time"):
+        if field not in row or row[field] in (None, ""):
+            errors.append(f"{field} is required")
+    if errors:
+        return errors
+
+    try:
+        q = _question_from_row(row)
+        options = json.loads(q.options)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        return [f"cannot decode row: {exc}"]
+
+    if q.choice_type not in {"single", "multi"}:
+        errors.append(f"invalid choice_type {q.choice_type!r}")
+    if q.question_type not in {"yes_no", "binary_named", "multiple_choice"}:
+        errors.append(f"invalid question_type {q.question_type!r}")
+    if not isinstance(options, list) or len(options) < 2:
+        errors.append("options must be a JSON array with at least two entries")
+    elif any(not isinstance(option, str) or not option.strip() for option in options):
+        errors.append("all options must be non-empty strings")
+
+    try:
+        end_time = _normalise_date(q.end_time)
+    except DatasetBuildError as exc:
+        errors.append(str(exc))
+    else:
+        if end_time != q.end_time:
+            errors.append(f"end_time must be YYYY-MM-DD, got {q.end_time!r}")
+
+    try:
+        gt = parse_gt(q.answer)
+    except ValueError as exc:
+        errors.append(str(exc))
+        gt = frozenset()
+
+    if options and gt:
+        expected_letters = {index_to_letter(i) for i in range(len(options))}
+        extra = gt - expected_letters
+        if extra:
+            errors.append(f"answer letters outside option range: {sorted(extra)}")
+    if q.choice_type == "single" and len(gt) != 1:
+        errors.append("single choice_type must have exactly one answer letter")
+    if q.choice_type == "multi" and len(gt) <= 1:
+        errors.append("multi choice_type must have at least two answer letters")
+    if q.question_type == "yes_no" and options != ["Yes", "No"]:
+        errors.append("yes_no options must be [\"Yes\", \"No\"]")
+    if q.question_type == "binary_named" and len(options) != 2:
+        errors.append("binary_named must have exactly two options")
+
+    try:
+        rendered = render_user_prompt(q, DEFAULT_PROMPT_TEMPLATES)
+        parsed = parse_answer(f"\\boxed{{{_payload_for_answer(q)}}}", q)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        errors.append(f"render/parser round-trip failed: {exc}")
+    else:
+        if q.event not in rendered:
+            errors.append("rendered prompt does not contain event")
+        if parsed != gt:
+            errors.append(f"parser round-trip mismatch: {parsed} != {gt}")
+
+    return errors
+
+
+def validate_database(
+    db_path: str | Path,
+    *,
+    table: str = DEFAULT_TABLE,
+    min_end_date: str = DEFAULT_MIN_END_DATE,
+    min_rows: int = DEFAULT_MIN_ROWS,
+) -> ValidationReport:
+    path = Path(db_path)
+    if not path.exists():
+        return ValidationReport(
+            row_count=0,
+            bad_rows=[ValidationIssue("__database__", f"missing database: {path}")],
+            by_question_type={},
+            by_choice_type={},
+            min_end_time=None,
+            max_end_time=None,
+        )
+
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    bad_rows: list[ValidationIssue] = []
+    try:
+        tables = {
+            r["name"]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if table not in tables:
+            bad_rows.append(ValidationIssue("__database__", f"missing table {table!r}"))
+            return ValidationReport(0, bad_rows, {}, {}, None, None)
+
+        rows = conn.execute(
+            f"SELECT id, choice_type, question_type, event, options, answer, end_time "
+            f"FROM {table} ORDER BY end_time, id"
         ).fetchall()
+    finally:
+        conn.close()
+
+    by_question_type: dict[str, int] = {}
+    by_choice_type: dict[str, int] = {}
+    end_times: list[str] = []
+
+    seen_ids: set[str] = set()
+    for row in rows:
+        row_dict = dict(row)
+        row_id = str(row_dict.get("id", ""))
+        if row_id in seen_ids:
+            bad_rows.append(ValidationIssue(row_id, "duplicate id"))
+        seen_ids.add(row_id)
+        by_question_type[row_dict["question_type"]] = by_question_type.get(row_dict["question_type"], 0) + 1
+        by_choice_type[row_dict["choice_type"]] = by_choice_type.get(row_dict["choice_type"], 0) + 1
+        end_times.append(row_dict["end_time"])
+        if row_dict["end_time"] < min_end_date:
+            bad_rows.append(
+                ValidationIssue(row_id, f"end_time {row_dict['end_time']} < {min_end_date}")
+            )
+        for message in _validate_question(row_dict):
+            bad_rows.append(ValidationIssue(row_id, message))
+
+    if len(rows) < min_rows:
+        bad_rows.append(
+            ValidationIssue("__database__", f"row_count {len(rows)} < required {min_rows}")
+        )
+
+    return ValidationReport(
+        row_count=len(rows),
+        bad_rows=bad_rows,
+        by_question_type=dict(sorted(by_question_type.items())),
+        by_choice_type=dict(sorted(by_choice_type.items())),
+        min_end_time=min(end_times) if end_times else None,
+        max_end_time=max(end_times) if end_times else None,
     )
-    print(f"by_month: {dict(by_month)}")
 
-    meta = dict(dst.execute("SELECT * FROM dataset_metadata").fetchone())
-    print(f"metadata.dataset_name={meta['dataset_name']}, table_name={meta['table_name']}, "
-          f"row_count={meta['row_count']}, imported_at_utc={meta['imported_at_utc']}")
 
-    dst.close()
-    src.close()
+def _load_source_records(source: str) -> list[dict[str, Any]]:
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise DatasetBuildError(
+            "pandas and pyarrow are required to read the source parquet; run "
+            "`uv run --with pandas --with pyarrow python scripts/build_forecast_eval_set.py`"
+        ) from exc
 
-    size = DST_DB.stat().st_size
-    sha = hashlib.sha256(DST_DB.read_bytes()).hexdigest()
-    print(f"\nfile: {DST_DB.name}, size={size}B, sha256={sha}")
+    frame = pd.read_parquet(source)
+    return list(frame.to_dict("records"))
+
+
+def build_rows(
+    source_records: Iterable[Mapping[str, Any]],
+    *,
+    min_end_date: str = DEFAULT_MIN_END_DATE,
+    allow_drop_bad: bool = True,
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    bad: list[ValidationIssue] = []
+    for i, record in enumerate(source_records):
+        row_id = str(record.get("id", f"row_{i}"))
+        try:
+            converted = _convert_source_record(record, min_end_date=min_end_date)
+        except (DatasetBuildError, TypeError, ValueError) as exc:
+            bad.append(ValidationIssue(row_id, str(exc)))
+            continue
+        if converted is not None:
+            rows.append(converted)
+
+    if bad and not allow_drop_bad:
+        lines = "\n".join(f"  {issue.row_id}: {issue.message}" for issue in bad[:30])
+        suffix = "" if len(bad) <= 30 else f"\n  ... {len(bad) - 30} more"
+        raise DatasetBuildError(f"{len(bad)} source rows could not be parsed:\n{lines}{suffix}")
+    if bad:
+        lines = "\n".join(f"  {issue.row_id}: {issue.message}" for issue in bad[:10])
+        suffix = "" if len(bad) <= 10 else f"\n  ... {len(bad) - 10} more"
+        print(f"dropped {len(bad)} source rows:\n{lines}{suffix}", file=sys.stderr)
+
+    rows.sort(key=lambda row: (row["end_time"], row["id"]))
+    return rows
+
+
+def _write_database(rows: Sequence[Mapping[str, str]], db_path: Path, *, table: str) -> None:
+    if db_path.exists():
+        db_path.unlink()
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.executescript(
+            f"""
+            CREATE TABLE {table} (
+                id            TEXT PRIMARY KEY,
+                choice_type   TEXT NOT NULL CHECK (choice_type IN ('single','multi')),
+                question_type TEXT NOT NULL CHECK (
+                    question_type IN ('yes_no','binary_named','multiple_choice')
+                ),
+                event         TEXT NOT NULL,
+                options       TEXT NOT NULL,
+                answer        TEXT NOT NULL,
+                end_time      TEXT NOT NULL
+            );
+            CREATE INDEX idx_{table}_choice_type ON {table}(choice_type);
+            CREATE INDEX idx_{table}_question_type ON {table}(question_type);
+            CREATE INDEX idx_{table}_end_time ON {table}(end_time);
+            """
+        )
+        conn.executemany(
+            f"INSERT INTO {table} "
+            f"(id, choice_type, question_type, event, options, answer, end_time) "
+            f"VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    row["id"],
+                    row["choice_type"],
+                    row["question_type"],
+                    row["event"],
+                    row["options"],
+                    row["answer"],
+                    row["end_time"],
+                )
+                for row in rows
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def build_database(
+    *,
+    source: str = DEFAULT_SOURCE_PARQUET,
+    output: Path = DEFAULT_OUTPUT_DB,
+    table: str = DEFAULT_TABLE,
+    min_end_date: str = DEFAULT_MIN_END_DATE,
+    min_rows: int = DEFAULT_MIN_ROWS,
+) -> ValidationReport:
+    source_records = _load_source_records(source)
+    rows = build_rows(source_records, min_end_date=min_end_date)
+    tmp = output.with_suffix(output.suffix + ".tmp")
+    _write_database(rows, tmp, table=table)
+    report = validate_database(tmp, table=table, min_end_date=min_end_date, min_rows=min_rows)
+    if report.bad_rows:
+        tmp.unlink(missing_ok=True)
+        lines = "\n".join(
+            f"  {issue.row_id}: {issue.message}" for issue in report.bad_rows[:30]
+        )
+        suffix = "" if len(report.bad_rows) <= 30 else f"\n  ... {len(report.bad_rows) - 30} more"
+        raise DatasetBuildError(f"generated database failed validation:\n{lines}{suffix}")
+    tmp.replace(output)
+    return report
+
+
+def _print_report(report: ValidationReport, output: Path) -> None:
+    print("=== verification ===")
+    print(f"row_count: {report.row_count}")
+    print(f"by_question_type: {report.by_question_type}")
+    print(f"by_choice_type: {report.by_choice_type}")
+    print(f"end_time: min={report.min_end_time}, max={report.max_end_time}")
+    size = output.stat().st_size
+    sha = hashlib.sha256(output.read_bytes()).hexdigest()
+    print(f"file: {output.name}, size={size}B, sha256={sha}")
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", default=DEFAULT_SOURCE_PARQUET)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_DB)
+    parser.add_argument("--table", default=DEFAULT_TABLE)
+    parser.add_argument("--min-end-date", default=DEFAULT_MIN_END_DATE)
+    parser.add_argument("--min-rows", type=int, default=DEFAULT_MIN_ROWS)
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        report = build_database(
+            source=args.source,
+            output=args.output,
+            table=args.table,
+            min_end_date=args.min_end_date,
+            min_rows=args.min_rows,
+        )
+    except DatasetBuildError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    _print_report(report, args.output)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

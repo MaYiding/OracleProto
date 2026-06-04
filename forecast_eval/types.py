@@ -7,7 +7,7 @@ from typing import Any
 @dataclass(frozen=True)
 class Question:
     """One row of the source-DB question table (default
-    `forecast_eval_set_example`, configurable via `SOURCE_TABLE`) after loader sync.
+    `test_cases`, configurable via `SOURCE_TABLE`) after loader sync.
 
     `options` is the raw JSON string; callers that need the Python list MUST
     `json.loads(q.options)` themselves so downstream comparisons stay byte-for-byte
