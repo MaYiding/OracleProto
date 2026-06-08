@@ -34,6 +34,8 @@ Visit Our Leaderboards: [oracleproto.com](https://oracleproto.com)
 - **Background & Challenges:** Evaluating LLM forecasting faces a dilemma: live benchmarks **expire easily**, and retrospective benchmarks suffer from **data leakage**. Prompting cannot establish a genuine **knowledge boundary**.
   
 - **Architecture & Methods:** The OracleProto framework combines model knowledge cutoffs and temporal masking to rigorously reconstruct historical events into **reproducible, time-bounded forecasting samples**.
+
+- **Prompt Rendering:** Each task prompt separates `event` from `end_time`. `end_time` is the resolution date that identifies the event instance; the search cutoff $`\chi_i`$ remains injected only inside the tool layer.
   
 - **Experimental Results:** Tests on six contemporary LLMs show that OracleProto effectively distinguishes models' forecasting quality, stability, and cost efficiency. It reduces the leakage rate to 1%, providing a controlled signal source for **model comparison, supervised fine-tuning, and reinforcement learning**.
 

@@ -56,7 +56,8 @@ def test_yes_no_render(templates: dict[str, str]) -> None:
     )
     rendered = render_user_prompt(q, templates)
     assert "2026 a dream year for trump?" in rendered
-    assert "resolved around 2026-01-31 (GMT+8)" in rendered
+    assert "Resolution date: 2026-01-31 (GMT+8)" in rendered
+    assert "For recurring or periodically reported events" in rendered
     assert "\nA." not in rendered  # no outcomes block
     assert "\\boxed{Yes}" in rendered or "boxed{Yes}" in rendered
 

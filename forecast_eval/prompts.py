@@ -28,8 +28,12 @@ DEFAULT_PROMPT_TEMPLATES: dict[str, str] = {
         "\\boxed{<options[0]>} or \\boxed{<options[1]>}"
     ),
     "prompt_template": (
-        '{agent_role} The event to be predicted: "{event} '
-        '(resolved around {end_time} (GMT+8)).{outcomes_block}"\n\n'
+        "{agent_role}\n\n"
+        "Event to predict: {event}\n"
+        "Resolution date: {end_time} (GMT+8). Use this date to identify the "
+        "event instance: it is when the event occurs, is decided, or has an "
+        "observable result. For recurring or periodically reported events, do "
+        "not substitute another cycle.{outcomes_block}\n\n"
         "IMPORTANT: Your final answer MUST end with this exact format:\n"
         "{output_format}\n"
         "{guidance}"
