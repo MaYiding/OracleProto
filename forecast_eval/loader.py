@@ -7,20 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from .db import utcnow_iso, connect as db_connect
-from .prompts import DEFAULT_PROMPT_TEMPLATES
+from .prompts import DEFAULT_PROMPT_TEMPLATES, REQUIRED_PROMPT_TEMPLATE_KEYS
 from .types import QFilter, Question
-
-
-_REQUIRED_TEMPLATE_KEYS = (
-    "agent_role",
-    "guidance",
-    "prompt_template",
-    "outcomes_block_rule",
-    "yes_no_output_format",
-    "binary_named_output_format",
-    "multiple_choice_single_output_format",
-    "multiple_choice_multi_output_format",
-)
 
 
 def _default_features() -> dict[str, Any]:
@@ -75,9 +63,12 @@ def sync_prompt_templates(
         else:
             flat[key] = json.dumps(value, ensure_ascii=False, sort_keys=True)
 
-    missing = [k for k in _REQUIRED_TEMPLATE_KEYS if k not in flat]
+    missing = [k for k in REQUIRED_PROMPT_TEMPLATE_KEYS if k not in flat]
     if missing:
         raise ValueError(f"prompt_reconstruction missing required keys: {missing}")
+    unexpected = [k for k in flat if k not in REQUIRED_PROMPT_TEMPLATE_KEYS]
+    if unexpected:
+        raise ValueError(f"prompt_reconstruction contains unknown keys: {unexpected}")
 
     now = utcnow_iso()
     results_conn.executemany(

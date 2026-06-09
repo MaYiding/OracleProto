@@ -6,10 +6,12 @@ import sqlite3
 import unicodedata
 from pathlib import Path
 
+import pytest
+
 from forecast_eval import db as dbmod
 from forecast_eval import loader
 from forecast_eval.config import Settings
-from forecast_eval.prompts import render_user_prompt
+from forecast_eval.prompts import DEFAULT_PROMPT_TEMPLATES, render_user_prompt
 from forecast_eval.types import Question
 from scripts.build_forecast_eval_set import build_rows, validate_database
 
@@ -204,3 +206,27 @@ def test_source_db_without_dataset_metadata_uses_default_prompt_templates(
         templates,
     )
     assert "Will the event happen?" in rendered
+
+
+def test_source_prompt_templates_reject_unknown_keys(tmp_path: Path) -> None:
+    src = tmp_path / "source.db"
+    conn = sqlite3.connect(src)
+    conn.execute("CREATE TABLE dataset_metadata (features_json TEXT NOT NULL)")
+    features = {
+        "prompt_reconstruction": {
+            **DEFAULT_PROMPT_TEMPLATES,
+            "prompt_template": "{agent_role}\n{output_format}",
+        }
+    }
+    conn.execute(
+        "INSERT INTO dataset_metadata VALUES (?)",
+        (json.dumps(features, ensure_ascii=False),),
+    )
+    conn.commit()
+    conn.close()
+
+    results_conn = dbmod.connect(tmp_path / "results.db")
+    dbmod.init_schema(results_conn, sampling_n=1)
+
+    with pytest.raises(ValueError, match="unknown keys"):
+        loader.sync_prompt_templates(src, results_conn)
