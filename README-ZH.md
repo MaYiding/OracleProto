@@ -37,6 +37,8 @@ OracleProto 问的是“你能预测未来吗”
 
 - **架构和方法：** OracleProto 框架结合模型知识截止与时间遮蔽，将历史事件严谨重构为**具有时间边界的可复现的预测样本**。
 
+- **Prompt 渲染：** 每条题目把 `event` 与 `end_time` 分开给模型。`end_time` 是定位事件实例的 resolution date；检索 cutoff $`\chi_i`$ 仍只在工具层注入。
+
 - **实验的效果：** 测试6种主流LLM 表明，OracleProto能有效区分了模型的预测质量、稳定性与成本效益，将泄露率降至1%，为**模型对比、监督微调和强化学习**提供了受控的信号源。
 
 <div align="center">
