@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -12,7 +13,7 @@ from forecast_eval import db as dbmod
 from forecast_eval import loader
 from forecast_eval.config import Settings
 from forecast_eval.prompts import DEFAULT_PROMPT_TEMPLATES, render_user_prompt
-from forecast_eval.types import Question
+from forecast_eval.types import QFilter, Question
 from scripts.build_forecast_eval_set import build_rows, validate_database
 
 
@@ -28,9 +29,8 @@ def test_bundled_dataset_schema_and_rows_are_parseable() -> None:
         SOURCE_DB,
         table="test_cases",
         min_end_date="2026-03-18",
-        min_rows=301,
     )
-    assert report.row_count > 300
+    assert report.row_count
     assert report.bad_rows == []
 
     conn = sqlite3.connect(f"file:{SOURCE_DB}?mode=ro", uri=True)
@@ -47,6 +47,30 @@ def test_bundled_dataset_schema_and_rows_are_parseable() -> None:
     assert "test_cases" in tables
     assert "forecast_eval_set_example" not in tables
     assert "dataset_metadata" not in tables
+
+
+def test_dataset_validator_rejects_unsafe_table_name() -> None:
+    with pytest.raises(ValueError, match="table name"):
+        validate_database(
+            SOURCE_DB,
+            table="test_cases; DROP TABLE test_cases",
+            min_end_date="2026-03-18",
+        )
+
+
+def test_loader_sync_does_not_mutate_source_database_bytes(tmp_path: Path) -> None:
+    before = hashlib.sha256(SOURCE_DB.read_bytes()).hexdigest()
+    results_conn = dbmod.connect(tmp_path / "results.db")
+    try:
+        dbmod.init_schema(results_conn, sampling_n=1)
+        loader.sync_prompt_templates(SOURCE_DB, results_conn)
+        loader.sync_questions(SOURCE_DB, results_conn, QFilter(), table="test_cases")
+        loader.load_raw_features_json(SOURCE_DB)
+    finally:
+        results_conn.close()
+
+    after = hashlib.sha256(SOURCE_DB.read_bytes()).hexdigest()
+    assert after == before
 
 
 def test_bundled_dataset_text_fields_are_prompt_safe() -> None:

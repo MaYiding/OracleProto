@@ -84,7 +84,7 @@ DEFAULT_PROMPT_TEMPLATES: dict[str, str] = {
         f"{_FINAL_FORMAT_REQUIREMENT}\n"
         "the single correct letter inside the box, e.g. \\boxed{A}.\n"
         "Do NOT list more than one letter, even if you believe two outcomes are tied "
-        "\u2014 pick the one you find most likely."
+        "; pick the one you find most likely."
     ),
     "multiple_choice_multi_output_format": (
         "This is a MULTI-SELECT question: ONE OR MORE of the listed options can be correct.\n"

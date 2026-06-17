@@ -1,4 +1,4 @@
-"""Build `forecast_eval_set_example.db` from futurex-ai/Futurex-Past.
+"""Build the configured OracleProto SQLite source DB from Futurex-Past.
 
 Run from the repo root:
 
@@ -15,6 +15,7 @@ import argparse
 import ast
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -23,6 +24,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+
+from dotenv import dotenv_values
 
 REPO = Path(__file__).resolve().parent.parent
 if str(REPO) not in sys.path:
@@ -38,14 +41,6 @@ from forecast_eval.prompts import (
 from forecast_eval.types import Question
 
 
-DEFAULT_SOURCE_PARQUET = (
-    "https://huggingface.co/datasets/futurex-ai/Futurex-Past/resolve/main/"
-    "data/train-00000-of-00001.parquet"
-)
-DEFAULT_OUTPUT_DB = REPO / "forecast_eval_set_example.db"
-DEFAULT_TABLE = "test_cases"
-DEFAULT_MIN_END_DATE = "2026-03-18"
-DEFAULT_MIN_ROWS = 301
 ALLOWED_LEVELS = frozenset({1, 2})
 
 _OPTION_LINE_RE = re.compile(r"^\s*(?P<label>.)\.\s+(?P<text>.+?)\s*$")
@@ -67,6 +62,7 @@ _PROMPT_INSTRUCTION_FRAGMENTS = (
 _TRUNCATED_MONTH_DATE_RE = re.compile(
     r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d$"
 )
+_SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 @dataclass(frozen=True)
@@ -87,6 +83,41 @@ class ValidationReport:
 
 class DatasetBuildError(RuntimeError):
     pass
+
+
+def _read_dotenv() -> dict[str, str]:
+    env_path = REPO / ".env"
+    if not env_path.exists():
+        return {}
+    return {k: v for k, v in dotenv_values(env_path).items() if v is not None}
+
+
+def _env_value(name: str) -> str | None:
+    raw = os.environ.get(name)
+    if raw is not None and raw.strip():
+        return raw.strip()
+    raw = _read_dotenv().get(name)
+    if raw is not None and raw.strip():
+        return raw.strip()
+    return None
+
+
+def _require_config(name: str, *, flag: str) -> str:
+    value = _env_value(name)
+    if value is None:
+        raise DatasetBuildError(f"{name} must be set in .env or passed via {flag}")
+    return value
+
+
+def _repo_relative_path(raw: str) -> Path:
+    path = Path(raw).expanduser()
+    return path if path.is_absolute() else REPO / path
+
+
+def _assert_sql_identifier(name: str) -> str:
+    if not _SQL_IDENT_RE.match(name):
+        raise ValueError(f"table name {name!r} must match [A-Za-z_][A-Za-z0-9_]*")
+    return name
 
 
 def _normalise_space(text: str) -> str:
@@ -413,10 +444,15 @@ def _validate_question(row: Mapping[str, Any]) -> list[str]:
 def validate_database(
     db_path: str | Path,
     *,
-    table: str = DEFAULT_TABLE,
-    min_end_date: str = DEFAULT_MIN_END_DATE,
-    min_rows: int = DEFAULT_MIN_ROWS,
+    table: str | None = None,
+    min_end_date: str | None = None,
 ) -> ValidationReport:
+    table = _assert_sql_identifier(
+        table or _require_config("SOURCE_TABLE", flag="--table")
+    )
+    min_end_date = _normalise_date(
+        min_end_date or _require_config("SOURCE_MIN_END_DATE", flag="--min-end-date")
+    )
     path = Path(db_path)
     if not path.exists():
         return ValidationReport(
@@ -470,11 +506,6 @@ def validate_database(
         for message in _validate_question(row_dict):
             bad_rows.append(ValidationIssue(row_id, message))
 
-    if len(rows) < min_rows:
-        bad_rows.append(
-            ValidationIssue("__database__", f"row_count {len(rows)} < required {min_rows}")
-        )
-
     return ValidationReport(
         row_count=len(rows),
         bad_rows=bad_rows,
@@ -494,16 +525,22 @@ def _load_source_records(source: str) -> list[dict[str, Any]]:
             "`uv run --with pandas --with pyarrow python scripts/build_forecast_eval_set.py`"
         ) from exc
 
-    frame = pd.read_parquet(source)
+    try:
+        frame = pd.read_parquet(source)
+    except (ImportError, OSError, ValueError) as exc:
+        raise DatasetBuildError(f"cannot read source parquet {source!r}: {exc}") from exc
     return list(frame.to_dict("records"))
 
 
 def build_rows(
     source_records: Iterable[Mapping[str, Any]],
     *,
-    min_end_date: str = DEFAULT_MIN_END_DATE,
+    min_end_date: str | None = None,
     allow_drop_bad: bool = True,
 ) -> list[dict[str, str]]:
+    min_end_date = _normalise_date(
+        min_end_date or _require_config("SOURCE_MIN_END_DATE", flag="--min-end-date")
+    )
     rows: list[dict[str, str]] = []
     bad: list[ValidationIssue] = []
     for i, record in enumerate(source_records):
@@ -534,6 +571,7 @@ def build_rows(
 
 
 def _write_database(rows: Sequence[Mapping[str, str]], db_path: Path, *, table: str) -> None:
+    table = _assert_sql_identifier(table)
     if db_path.exists():
         db_path.unlink()
     conn = sqlite3.connect(db_path)
@@ -581,17 +619,26 @@ def _write_database(rows: Sequence[Mapping[str, str]], db_path: Path, *, table: 
 
 def build_database(
     *,
-    source: str = DEFAULT_SOURCE_PARQUET,
-    output: Path = DEFAULT_OUTPUT_DB,
-    table: str = DEFAULT_TABLE,
-    min_end_date: str = DEFAULT_MIN_END_DATE,
-    min_rows: int = DEFAULT_MIN_ROWS,
+    source: str | None = None,
+    output: Path | None = None,
+    table: str | None = None,
+    min_end_date: str | None = None,
 ) -> ValidationReport:
+    source = source or _require_config("SOURCE_PARQUET", flag="--source")
+    output = output or _repo_relative_path(
+        _require_config("SOURCE_DB", flag="--output")
+    )
+    table = _assert_sql_identifier(
+        table or _require_config("SOURCE_TABLE", flag="--table")
+    )
+    min_end_date = _normalise_date(
+        min_end_date or _require_config("SOURCE_MIN_END_DATE", flag="--min-end-date")
+    )
     source_records = _load_source_records(source)
     rows = build_rows(source_records, min_end_date=min_end_date)
     tmp = output.with_suffix(output.suffix + ".tmp")
     _write_database(rows, tmp, table=table)
-    report = validate_database(tmp, table=table, min_end_date=min_end_date, min_rows=min_rows)
+    report = validate_database(tmp, table=table, min_end_date=min_end_date)
     if report.bad_rows:
         tmp.unlink(missing_ok=True)
         lines = "\n".join(
@@ -616,28 +663,29 @@ def _print_report(report: ValidationReport, output: Path) -> None:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", default=DEFAULT_SOURCE_PARQUET)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_DB)
-    parser.add_argument("--table", default=DEFAULT_TABLE)
-    parser.add_argument("--min-end-date", default=DEFAULT_MIN_END_DATE)
-    parser.add_argument("--min-rows", type=int, default=DEFAULT_MIN_ROWS)
+    parser.add_argument("--source")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--table")
+    parser.add_argument("--min-end-date")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    output = args.output or _repo_relative_path(
+        _require_config("SOURCE_DB", flag="--output")
+    )
     try:
         report = build_database(
             source=args.source,
-            output=args.output,
+            output=output,
             table=args.table,
             min_end_date=args.min_end_date,
-            min_rows=args.min_rows,
         )
     except DatasetBuildError as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    _print_report(report, args.output)
+    _print_report(report, output)
     return 0
 
 

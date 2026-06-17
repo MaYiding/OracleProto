@@ -174,7 +174,8 @@ async def test_smoke_dry_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     templates = loader.sync_prompt_templates(SOURCE_DB, conn)
 
     # Re-load just the 3 targeted questions
-    src = dbmod.connect(SOURCE_DB)
+    src = sqlite3.connect(f"file:{SOURCE_DB}?mode=ro", uri=True)
+    src.row_factory = sqlite3.Row
     placeholders = ",".join("?" * len(ids))
     questions_rows = src.execute(
         f"SELECT id, choice_type, question_type, event, options, answer, end_time "

@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .db import utcnow_iso, connect as db_connect
+from .db import utcnow_iso
 from .prompts import DEFAULT_PROMPT_TEMPLATES, REQUIRED_PROMPT_TEMPLATE_KEYS
 from .types import QFilter, Question
 
@@ -23,6 +23,13 @@ def _source_has_table(src_conn: sqlite3.Connection, table: str) -> bool:
         (table,),
     ).fetchone()
     return row is not None
+
+
+def _connect_source(source_db: str | Path) -> sqlite3.Connection:
+    uri = Path(source_db).resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def _read_features_json(src_conn: sqlite3.Connection) -> dict[str, Any]:
@@ -46,7 +53,7 @@ def sync_prompt_templates(
     String fields are stored verbatim; nested (dict/list) values are JSON-serialised
     into the same key so downstream readers can `json.loads` on demand.
     """
-    src = db_connect(source_db)
+    src = _connect_source(source_db)
     try:
         features = _read_features_json(src)
     finally:
@@ -99,7 +106,7 @@ def sync_questions(
         raise ValueError(
             f"sync_questions: table {table!r} must match [A-Za-z_][A-Za-z0-9_]*"
         )
-    src = db_connect(source_db)
+    src = _connect_source(source_db)
     try:
         where, params = filters.apply_sql()
         rows = src.execute(
@@ -150,7 +157,7 @@ def sync_questions(
 
 def load_raw_features_json(source_db: str | Path) -> str:
     """Return the raw `features_json` string for metadata hashing."""
-    src = db_connect(source_db)
+    src = _connect_source(source_db)
     try:
         if not _source_has_table(src, "dataset_metadata"):
             return json.dumps(_default_features(), ensure_ascii=False, sort_keys=True)
