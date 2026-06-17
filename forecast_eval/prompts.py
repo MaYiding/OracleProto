@@ -5,6 +5,103 @@ import json
 from .types import Question
 
 
+_FINAL_FORMAT_REQUIREMENT = "Your final answer MUST end with this exact format:"
+_BOXED_OUTPUT_MARKER = "\\boxed{"
+
+
+DEFAULT_PROMPT_TEMPLATES: dict[str, str] = {
+    "agent_role": "You are an agent that can predict future events.",
+    "guidance": (
+        "Do not use any other format. Do not refuse to make a prediction. "
+        'Do not say "I cannot predict the future." You must make a clear '
+        "prediction based on the best data currently available, using the box "
+        "format specified above."
+    ),
+    "yes_no_output_format": (
+        "Your task is to predict whether the event will occur based on your analysis.\n"
+        "Your prediction will be scored based on its accuracy. You will only receive "
+        "points if your answer is correct.\n"
+        f"{_FINAL_FORMAT_REQUIREMENT}\n"
+        "\\boxed{Yes} or \\boxed{No}"
+    ),
+    "binary_named_output_format": (
+        "Your task is to predict which of the two outcomes will occur based on your analysis.\n"
+        "Your prediction will be scored based on its accuracy. You will only receive "
+        "points if your answer is correct.\n"
+        f"{_FINAL_FORMAT_REQUIREMENT}\n"
+        "\\boxed{<options[0]>} or \\boxed{<options[1]>}"
+    ),
+    "yes_no_prompt_template": (
+        "{agent_role}\n\n"
+        "Event to predict: {event}\n"
+        "Resolution date: {end_time} (GMT+8). Use this date to identify the "
+        "event instance: it is when the event occurs, is decided, or has an "
+        "observable result. For recurring or periodically reported events, do "
+        "not substitute another cycle.\n\n"
+        "{output_format}\n"
+        "{guidance}"
+    ),
+    "binary_named_prompt_template": (
+        "{agent_role}\n\n"
+        "Event to predict: {event}\n"
+        "Resolution date: {end_time} (GMT+8). Use this date to identify the "
+        "event instance: it is when the event occurs, is decided, or has an "
+        "observable result. For recurring or periodically reported events, do "
+        "not substitute another cycle.\n\n"
+        "{output_format}\n"
+        "{guidance}"
+    ),
+    "multiple_choice_single_prompt_template": (
+        "{agent_role}\n\n"
+        "Event to predict: {event}\n"
+        "Resolution date: {end_time} (GMT+8). Use this date to identify the "
+        "event instance: it is when the event occurs, is decided, or has an "
+        "observable result. For recurring or periodically reported events, do "
+        "not substitute another cycle.\n\n"
+        "Options:{outcomes_block}\n\n"
+        "{output_format}\n"
+        "{guidance}"
+    ),
+    "multiple_choice_multi_prompt_template": (
+        "{agent_role}\n\n"
+        "Event to predict: {event}\n"
+        "Resolution date: {end_time} (GMT+8). Use this date to identify the "
+        "event instance: it is when the event occurs, is decided, or has an "
+        "observable result. For recurring or periodically reported events, do "
+        "not substitute another cycle.\n\n"
+        "Options:{outcomes_block}\n\n"
+        "{output_format}\n"
+        "{guidance}"
+    ),
+    "outcomes_block_rule": (
+        "Empty for yes_no/binary_named. For multiple_choice: '\\n' + "
+        "'A. <label>\\nB. <label>\\n...' built from options."
+    ),
+    "multiple_choice_single_output_format": (
+        "This is a SINGLE-ANSWER question: exactly ONE of the listed options is correct.\n"
+        "Your prediction will be scored on strict equality with the unique correct "
+        "letter; choosing the wrong letter, or selecting more than one letter, scores zero.\n"
+        f"{_FINAL_FORMAT_REQUIREMENT}\n"
+        "the single correct letter inside the box, e.g. \\boxed{A}.\n"
+        "Do NOT list more than one letter, even if you believe two outcomes are tied "
+        "; pick the one you find most likely."
+    ),
+    "multiple_choice_multi_output_format": (
+        "This is a MULTI-SELECT question: ONE OR MORE of the listed options can be correct.\n"
+        "Your prediction will be scored on strict equality with the FULL set of correct "
+        "letters: any extra letter, any missing letter, or any wrong letter scores zero. "
+        "You must include ALL correct options and NO incorrect options.\n"
+        f"{_FINAL_FORMAT_REQUIREMENT}\n"
+        "listing all correct option(s) you have identified, separated by commas, within the box.\n"
+        "For example: \\boxed{A} for a single correct option, or \\boxed{B, C} "
+        "for multiple correct options."
+    ),
+}
+
+
+REQUIRED_PROMPT_TEMPLATE_KEYS: tuple[str, ...] = tuple(DEFAULT_PROMPT_TEMPLATES)
+
+
 # Lowercase / symbolic labels are easily eaten by markdown (backticks /
 # underscores / asterisks). With >26 options the labels land on `[`, `\`, `]`,
 # `^`, `_`, `` ` ``, `a`, `b`, ... so we uniformly wrap any non-A-Z label in
@@ -14,9 +111,8 @@ _BACKTICK_SAFE_ASCII_RANGE = set(range(ord("A"), ord("Z") + 1))
 
 
 # Reflection protocol. Appended as a tail paragraph to the user message; it is
-# NOT part of dataset_metadata.prompt_reconstruction (so prompt_templates_hash
-# is unaffected) but is persisted in the user_prompt field so the run is fully
-# reproducible.
+# NOT part of prompt_templates (so prompt_templates_hash is unaffected) but is
+# persisted in the user_prompt field so the run is fully reproducible.
 # Design goal: use prompt engineering to pull the model from "1 web_search and
 # answer directly" to ">=3 distinct angles + reflection after each + opposite-
 # direction self-check", driven mostly by the protocol itself rather than a
@@ -444,6 +540,51 @@ def _build_outcomes_block(options: list[str]) -> str:
     return "\n" + "\n".join(lines)
 
 
+def _assert_outer_template_contract(
+    template_key: str,
+    prompt_template: str,
+    *,
+    requires_outcomes_block: bool,
+) -> None:
+    required_slots = ("agent_role", "event", "end_time", "output_format", "guidance")
+    missing = [slot for slot in required_slots if f"{{{slot}}}" not in prompt_template]
+    if requires_outcomes_block and "{outcomes_block}" not in prompt_template:
+        missing.append("outcomes_block")
+    if missing:
+        raise ValueError(
+            f"{template_key} missing required slot(s): {', '.join(missing)}"
+        )
+    if _FINAL_FORMAT_REQUIREMENT in prompt_template or _BOXED_OUTPUT_MARKER in prompt_template:
+        raise ValueError(
+            f"{template_key} must keep final-answer format instructions inside output_format"
+        )
+
+
+def _assert_output_format_contract(q: Question, output_format: str) -> None:
+    if _FINAL_FORMAT_REQUIREMENT not in output_format:
+        raise ValueError(
+            f"{q.question_type}/{q.choice_type} output_format must include "
+            f"{_FINAL_FORMAT_REQUIREMENT!r}"
+        )
+    if _BOXED_OUTPUT_MARKER not in output_format:
+        raise ValueError(
+            f"{q.question_type}/{q.choice_type} output_format must include a boxed answer"
+        )
+    if q.question_type == "yes_no":
+        required = ("\\boxed{Yes}", "\\boxed{No}")
+        missing = [marker for marker in required if marker not in output_format]
+        if missing:
+            raise ValueError(
+                "yes_no output_format missing required boxed option(s): "
+                + ", ".join(missing)
+            )
+    elif q.question_type == "binary_named":
+        if "<options[" in output_format:
+            raise ValueError("binary_named output_format still contains option placeholders")
+        if output_format.count(_BOXED_OUTPUT_MARKER) < 2:
+            raise ValueError("binary_named output_format must box both named outcomes")
+
+
 def render_user_prompt(
     q: Question,
     templates: dict[str, str],
@@ -454,26 +595,28 @@ def render_user_prompt(
 ) -> str:
     """Assemble the single user message handed to the LLM for one sample.
 
-    All template text lives in `templates` (synced from dataset_metadata). This
-    function only branches on `q.question_type` and handles the three
-    rendering rules from the prompt-rendering spec.
+    All template text lives in `templates` (synced by the loader). This
+    function selects the outer template by `q.question_type` and, for
+    multiple-choice questions, by `q.choice_type`.
 
     `budget_awareness_protocol` (if provided) is appended FIRST so the model
     has end-to-end budget awareness before reading the methodology layers.
     `reflection_protocol` and `belief_protocol` follow in that order. None of
     these are part of `prompt_templates`, so the run's `prompt_templates_hash`
-    stays bit-identical to runs without any of them; their presence is
+    is unchanged by these runtime additions; their presence is
     recorded via `Settings.config_snapshot` in `run_meta` and per-sample via
-    the `user_prompt` field. Passing nothing extra yields the v3 byte-
-    identical rendering.
+    the `user_prompt` field.
     """
     options = json.loads(q.options)
 
     if q.question_type == "yes_no":
+        prompt_template_key = "yes_no_prompt_template"
         outcomes_block = ""
         output_format = templates["yes_no_output_format"]
+        requires_outcomes_block = False
 
     elif q.question_type == "binary_named":
+        prompt_template_key = "binary_named_prompt_template"
         if len(options) != 2:
             raise ValueError(
                 f"binary_named question {q.id!r} must have exactly 2 options, got {len(options)}"
@@ -484,22 +627,34 @@ def render_user_prompt(
             .replace("<options[0]>", options[0])
             .replace("<options[1]>", options[1])
         )
+        requires_outcomes_block = False
 
     elif q.question_type == "multiple_choice":
         outcomes_block = _build_outcomes_block(options)
         if q.choice_type == "single":
+            prompt_template_key = "multiple_choice_single_prompt_template"
             output_format = templates["multiple_choice_single_output_format"]
         elif q.choice_type == "multi":
+            prompt_template_key = "multiple_choice_multi_prompt_template"
             output_format = templates["multiple_choice_multi_output_format"]
         else:
             raise ValueError(
                 f"multiple_choice question {q.id!r} has unknown choice_type {q.choice_type!r}"
             )
+        requires_outcomes_block = True
 
     else:
         raise ValueError(f"unknown question_type: {q.question_type!r}")
 
-    rendered = templates["prompt_template"].format(
+    prompt_template = templates[prompt_template_key]
+    _assert_outer_template_contract(
+        prompt_template_key,
+        prompt_template,
+        requires_outcomes_block=requires_outcomes_block,
+    )
+    _assert_output_format_contract(q, output_format)
+
+    rendered = prompt_template.format(
         agent_role=templates["agent_role"],
         event=q.event,
         end_time=q.end_time,
@@ -507,6 +662,10 @@ def render_user_prompt(
         output_format=output_format,
         guidance=templates["guidance"],
     )
+    if rendered.count(_FINAL_FORMAT_REQUIREMENT) != 1:
+        raise ValueError(
+            "rendered prompt must contain exactly one final-answer format requirement"
+        )
     if budget_awareness_protocol:
         rendered = rendered + budget_awareness_protocol
     if reflection_protocol:

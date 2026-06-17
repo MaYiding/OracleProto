@@ -6,7 +6,7 @@
 
 </div>
 
-$$\Large \text{预测} = \text{信息搜集} \times \text{证据整合} \times \text{情势研判} \times \text{行动决策}$$
+$`\Large \text{预测} = \text{信息搜集} \times \text{证据整合} \times \text{情势研判} \times \text{行动决策}`$
 
 <div align="center">
 
@@ -37,7 +37,9 @@ OracleProto 问的是“你能预测未来吗”
 
 - **架构和方法：** OracleProto 框架结合模型知识截止与时间遮蔽，将历史事件严谨重构为**具有时间边界的可复现的预测样本**。
 
-- **实验的效果：** 测试6种主流LLM 表明，OracleProto能有效区分了模型的预测质量、稳定性与成本效益，将泄露率降至1%，为**模型对比、监督微调和强化学习**提供了受控的信号源。
+- **Prompt 渲染：** 每条题目把 `event` 与 `end_time` 分开给模型。`end_time` 是定位事件实例的 resolution date；检索 cutoff $`\chi_i`$ 仍只在工具层注入。
+
+- **实验的效果：** 测试 6 种主流 LLM 表明，OracleProto 能区分模型的预测质量、稳定性与成本效益，将泄露率降至 1%，为**模型对比、监督微调和强化学习**提供了受控的信号源。
 
 <div align="center">
 
@@ -120,7 +122,9 @@ python evaluation.py
 
 ## 3. 接入自有数据集
 
-仓库随附 `forecast_eval_set_example.db`，包含 80 道人工精选的问题，覆盖三种题型，日期跨越 2026-03-12 至 2026-04-14。若要接入其他语料，仅需替换 `.env` 中的 `SOURCE_DB` 与 `SOURCE_TABLE`。
+仓库随附的 `forecast_eval_set_example.db` 是由 `futurex-ai/Futurex-Past` 生成的 SQLite 源库。它只有一张 `test_cases` 表，包含七列：`id`、`choice_type`、`question_type`、`event`、`options`、`answer` 与 `end_time`。该表含 357 行清洗后的样本，日期为 2026-03-19 至 2026-06-09：138 行 `yes_no`、10 行 `binary_named`、209 行 `multiple_choice`；其中 41 行 `multiple_choice` 是多答案题。
+
+接入其他语料时，先创建同样七列的 SQLite 表，再在 `.env` 中指向 `SOURCE_DB` 与 `SOURCE_TABLE`。源库不需要 `dataset_metadata`；缺少该表时，loader 使用 `forecast_eval.prompts.DEFAULT_PROMPT_TEMPLATES`。只有当数据集需要携带自己的 11 个 prompt-template 键时，才添加 `dataset_metadata.features_json.prompt_reconstruction`。
 
 ---
 

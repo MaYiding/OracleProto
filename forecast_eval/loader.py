@@ -6,23 +6,35 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .db import utcnow_iso, connect as db_connect
+from .db import utcnow_iso
+from .prompts import DEFAULT_PROMPT_TEMPLATES, REQUIRED_PROMPT_TEMPLATE_KEYS
 from .types import QFilter, Question
 
 
-_REQUIRED_TEMPLATE_KEYS = (
-    "agent_role",
-    "guidance",
-    "prompt_template",
-    "outcomes_block_rule",
-    "yes_no_output_format",
-    "binary_named_output_format",
-    "multiple_choice_single_output_format",
-    "multiple_choice_multi_output_format",
-)
+def _default_features() -> dict[str, Any]:
+    return {
+        "prompt_reconstruction": dict(DEFAULT_PROMPT_TEMPLATES),
+    }
+
+
+def _source_has_table(src_conn: sqlite3.Connection, table: str) -> bool:
+    row = src_conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _connect_source(source_db: str | Path) -> sqlite3.Connection:
+    uri = Path(source_db).resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def _read_features_json(src_conn: sqlite3.Connection) -> dict[str, Any]:
+    if not _source_has_table(src_conn, "dataset_metadata"):
+        return _default_features()
     row = src_conn.execute("SELECT features_json FROM dataset_metadata").fetchone()
     if row is None:
         raise ValueError(
@@ -35,13 +47,13 @@ def sync_prompt_templates(
     source_db: str | Path,
     results_conn: sqlite3.Connection,
 ) -> dict[str, str]:
-    """Flatten `dataset_metadata.features_json.prompt_reconstruction` into
+    """Flatten source prompt templates into
     `results.db.prompt_templates` and return it as a dict for in-memory use.
 
     String fields are stored verbatim; nested (dict/list) values are JSON-serialised
     into the same key so downstream readers can `json.loads` on demand.
     """
-    src = db_connect(source_db)
+    src = _connect_source(source_db)
     try:
         features = _read_features_json(src)
     finally:
@@ -58,9 +70,12 @@ def sync_prompt_templates(
         else:
             flat[key] = json.dumps(value, ensure_ascii=False, sort_keys=True)
 
-    missing = [k for k in _REQUIRED_TEMPLATE_KEYS if k not in flat]
+    missing = [k for k in REQUIRED_PROMPT_TEMPLATE_KEYS if k not in flat]
     if missing:
         raise ValueError(f"prompt_reconstruction missing required keys: {missing}")
+    unexpected = [k for k in flat if k not in REQUIRED_PROMPT_TEMPLATE_KEYS]
+    if unexpected:
+        raise ValueError(f"prompt_reconstruction contains unknown keys: {unexpected}")
 
     now = utcnow_iso()
     results_conn.executemany(
@@ -78,7 +93,7 @@ def sync_questions(
     source_db: str | Path,
     results_conn: sqlite3.Connection,
     filters: QFilter,
-    table: str = "forecast_eval_set_example",
+    table: str = "test_cases",
 ) -> list[Question]:
     """Copy the filtered question rows from `<source_db>.<table>` into
     `results.db.questions`.
@@ -91,7 +106,7 @@ def sync_questions(
         raise ValueError(
             f"sync_questions: table {table!r} must match [A-Za-z_][A-Za-z0-9_]*"
         )
-    src = db_connect(source_db)
+    src = _connect_source(source_db)
     try:
         where, params = filters.apply_sql()
         rows = src.execute(
@@ -142,8 +157,10 @@ def sync_questions(
 
 def load_raw_features_json(source_db: str | Path) -> str:
     """Return the raw `features_json` string for metadata hashing."""
-    src = db_connect(source_db)
+    src = _connect_source(source_db)
     try:
+        if not _source_has_table(src, "dataset_metadata"):
+            return json.dumps(_default_features(), ensure_ascii=False, sort_keys=True)
         row = src.execute("SELECT features_json FROM dataset_metadata").fetchone()
     finally:
         src.close()

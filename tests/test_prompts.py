@@ -56,9 +56,178 @@ def test_yes_no_render(templates: dict[str, str]) -> None:
     )
     rendered = render_user_prompt(q, templates)
     assert "2026 a dream year for trump?" in rendered
-    assert "resolved around 2026-01-31 (GMT+8)" in rendered
+    assert "Resolution date: 2026-01-31 (GMT+8)" in rendered
+    assert "For recurring or periodically reported events" in rendered
     assert "\nA." not in rendered  # no outcomes block
     assert "\\boxed{Yes}" in rendered or "boxed{Yes}" in rendered
+
+
+def test_type_specific_outer_templates_are_selected(templates: dict[str, str]) -> None:
+    yes_no_templates = dict(templates)
+    yes_no_templates["yes_no_prompt_template"] += "\nYES_NO_SENTINEL"
+    yes_no_templates["multiple_choice_single_prompt_template"] += "\nMC_SINGLE_SENTINEL"
+    yes_no = Question(
+        id="q_yn_template",
+        choice_type="single",
+        question_type="yes_no",
+        event="Will the event happen?",
+        options=json.dumps(["Yes", "No"]),
+        answer="A",
+        end_time="2026-01-01",
+    )
+    mc = Question(
+        id="q_mc_template",
+        choice_type="single",
+        question_type="multiple_choice",
+        event="Pick one",
+        options=json.dumps(["Alpha", "Beta", "Gamma"]),
+        answer="A",
+        end_time="2026-01-01",
+    )
+
+    rendered_yes_no = render_user_prompt(yes_no, yes_no_templates)
+    rendered_mc = render_user_prompt(mc, yes_no_templates)
+
+    assert "YES_NO_SENTINEL" in rendered_yes_no
+    assert "MC_SINGLE_SENTINEL" not in rendered_yes_no
+    assert "MC_SINGLE_SENTINEL" in rendered_mc
+    assert "YES_NO_SENTINEL" not in rendered_mc
+
+
+def test_final_format_requirement_appears_once_per_rendered_prompt(
+    templates: dict[str, str],
+) -> None:
+    marker = "Your final answer MUST end with this exact format:"
+    questions = [
+        Question(
+            id="q_yn_marker",
+            choice_type="single",
+            question_type="yes_no",
+            event="Will the event happen?",
+            options=json.dumps(["Yes", "No"]),
+            answer="A",
+            end_time="2026-01-01",
+        ),
+        Question(
+            id="q_bn_marker",
+            choice_type="single",
+            question_type="binary_named",
+            event="Team A vs. Team B",
+            options=json.dumps(["Team A", "Team B"]),
+            answer="A",
+            end_time="2026-01-01",
+        ),
+        Question(
+            id="q_mc_single_marker",
+            choice_type="single",
+            question_type="multiple_choice",
+            event="Pick one",
+            options=json.dumps(["Alpha", "Beta", "Gamma"]),
+            answer="A",
+            end_time="2026-01-01",
+        ),
+        Question(
+            id="q_mc_multi_marker",
+            choice_type="multi",
+            question_type="multiple_choice",
+            event="Pick all",
+            options=json.dumps(["Alpha", "Beta", "Gamma"]),
+            answer="A, B",
+            end_time="2026-01-01",
+        ),
+    ]
+
+    assert [render_user_prompt(q, templates).count(marker) for q in questions] == [
+        1,
+        1,
+        1,
+        1,
+    ]
+
+
+def test_render_rejects_outer_template_without_output_format_slot(
+    templates: dict[str, str],
+) -> None:
+    bad_templates = dict(templates)
+    bad_templates["yes_no_prompt_template"] = bad_templates[
+        "yes_no_prompt_template"
+    ].replace("{output_format}\n", "")
+    q = Question(
+        id="q_missing_output_format",
+        choice_type="single",
+        question_type="yes_no",
+        event="Will the event happen?",
+        options=json.dumps(["Yes", "No"]),
+        answer="A",
+        end_time="2026-01-01",
+    )
+
+    with pytest.raises(ValueError, match="missing required slot"):
+        render_user_prompt(q, bad_templates)
+
+
+def test_render_rejects_outer_template_with_final_format_requirement(
+    templates: dict[str, str],
+) -> None:
+    bad_templates = dict(templates)
+    bad_templates["yes_no_prompt_template"] = (
+        bad_templates["yes_no_prompt_template"]
+        + "\nYour final answer MUST end with this exact format:"
+    )
+    q = Question(
+        id="q_outer_format",
+        choice_type="single",
+        question_type="yes_no",
+        event="Will the event happen?",
+        options=json.dumps(["Yes", "No"]),
+        answer="A",
+        end_time="2026-01-01",
+    )
+
+    with pytest.raises(ValueError, match="inside output_format"):
+        render_user_prompt(q, bad_templates)
+
+
+def test_render_rejects_inner_output_format_without_final_format_requirement(
+    templates: dict[str, str],
+) -> None:
+    bad_templates = dict(templates)
+    bad_templates["yes_no_output_format"] = bad_templates[
+        "yes_no_output_format"
+    ].replace("Your final answer MUST end with this exact format:\n", "")
+    q = Question(
+        id="q_inner_format",
+        choice_type="single",
+        question_type="yes_no",
+        event="Will the event happen?",
+        options=json.dumps(["Yes", "No"]),
+        answer="A",
+        end_time="2026-01-01",
+    )
+
+    with pytest.raises(ValueError, match="output_format must include"):
+        render_user_prompt(q, bad_templates)
+
+
+def test_render_rejects_multiple_choice_outer_template_without_outcomes(
+    templates: dict[str, str],
+) -> None:
+    bad_templates = dict(templates)
+    bad_templates["multiple_choice_single_prompt_template"] = bad_templates[
+        "multiple_choice_single_prompt_template"
+    ].replace("Options:{outcomes_block}\n\n", "")
+    q = Question(
+        id="q_missing_outcomes",
+        choice_type="single",
+        question_type="multiple_choice",
+        event="Pick one",
+        options=json.dumps(["Alpha", "Beta", "Gamma"]),
+        answer="A",
+        end_time="2026-01-01",
+    )
+
+    with pytest.raises(ValueError, match="outcomes_block"):
+        render_user_prompt(q, bad_templates)
 
 
 def test_binary_named_render_replaces_placeholders(templates: dict[str, str]) -> None:

@@ -6,7 +6,7 @@
 
 </div>
 
-$$\Large \text{Forecasting} = \text{Gathering} \times \text{Synthesis} \times \text{Judgment} \times \text{Decision}$$
+$`\Large \text{Forecasting} = \text{Gathering} \times \text{Synthesis} \times \text{Judgment} \times \text{Decision}`$
 
 <div align="center">
 
@@ -34,8 +34,10 @@ Visit Our Leaderboards: [oracleproto.com](https://oracleproto.com)
 - **Background & Challenges:** Evaluating LLM forecasting faces a dilemma: live benchmarks **expire easily**, and retrospective benchmarks suffer from **data leakage**. Prompting cannot establish a genuine **knowledge boundary**.
   
 - **Architecture & Methods:** The OracleProto framework combines model knowledge cutoffs and temporal masking to rigorously reconstruct historical events into **reproducible, time-bounded forecasting samples**.
+
+- **Prompt Rendering:** Each task prompt separates `event` from `end_time`. `end_time` is the resolution date that identifies the event instance; the search cutoff $`\chi_i`$ remains injected only inside the tool layer.
   
-- **Experimental Results:** Tests on six contemporary LLMs show that OracleProto effectively distinguishes models' forecasting quality, stability, and cost efficiency. It reduces the leakage rate to 1%, providing a controlled signal source for **model comparison, supervised fine-tuning, and reinforcement learning**.
+- **Experimental Results:** Tests on six contemporary LLMs show that OracleProto distinguishes models' forecasting quality, stability, and cost efficiency. It reduces the leakage rate to 1%, providing a controlled signal source for **model comparison, supervised fine-tuning, and reinforcement learning**.
 
 <div align="center">
 
@@ -124,9 +126,19 @@ retry under the original backoff policy.
 
 ## 3. Bring your own dataset
 
-The bundled `forecast_eval_set_example.db` carries 80 curated questions across
-three question types, with dates spanning 2026-03-12 to 2026-04-14. To plug in
-another corpus, swap `SOURCE_DB` and `SOURCE_TABLE` in `.env`.
+The bundled `forecast_eval_set_example.db` is a SQLite source generated from
+`futurex-ai/Futurex-Past`. It contains one table, `test_cases`, with seven
+columns: `id`, `choice_type`, `question_type`, `event`, `options`, `answer`,
+and `end_time`. The table has 357 cleaned rows spanning 2026-03-19 to
+2026-06-09: 138 `yes_no`, 10 `binary_named`, and 209 `multiple_choice` rows;
+41 of the `multiple_choice` rows are multi-answer questions.
+
+To plug in another corpus, create a SQLite table with the same seven columns
+and point `SOURCE_DB` and `SOURCE_TABLE` at it in `.env`. A source DB does not
+need `dataset_metadata`; when that table is absent, the loader uses
+`forecast_eval.prompts.DEFAULT_PROMPT_TEMPLATES`. Add
+`dataset_metadata.features_json.prompt_reconstruction` only when the dataset
+must carry its own eleven prompt-template keys.
 
 ---
 
