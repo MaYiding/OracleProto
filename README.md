@@ -129,9 +129,10 @@ retry under the original backoff policy.
 The bundled `forecast_eval_set_example.db` is a SQLite source generated from
 `futurex-ai/Futurex-Past`. It contains one table, `test_cases`, with seven
 columns: `id`, `choice_type`, `question_type`, `event`, `options`, `answer`,
-and `end_time`. The table has 357 cleaned rows spanning 2026-03-19 to
-2026-06-09: 138 `yes_no`, 10 `binary_named`, and 209 `multiple_choice` rows;
-41 of the `multiple_choice` rows are multi-answer questions.
+and `end_time`. The table has 300 curated Level 1/2 rows spanning 2026-03-19 to
+2026-09-22. It contains 130 binary questions (yes/no or two named options),
+130 single-answer questions with at least three options, and 40 multi-answer
+questions. Sports and esports account for 54 questions (18%).
 
 To plug in another corpus, create a SQLite table with the same seven columns
 and point `SOURCE_DB` and `SOURCE_TABLE` at it in `.env`. A source DB does not

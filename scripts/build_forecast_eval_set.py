@@ -224,7 +224,13 @@ def _parse_ground_truth(value: Any) -> list[str]:
         else:
             values = list(parsed) if isinstance(parsed, (list, tuple)) else [parsed]
 
-    cleaned = [_normalise_space(str(v).strip().strip("'\"")) for v in values]
+    cleaned = []
+    for value in values:
+        text = _normalise_space(str(value).strip().strip("'\""))
+        boxed = re.fullmatch(r"\\+boxed\{([^{}]+)\}", text)
+        if boxed:
+            text = _normalise_space(boxed.group(1))
+        cleaned.append(text)
     cleaned = [v for v in cleaned if v]
     if not cleaned:
         raise DatasetBuildError("empty ground_truth")

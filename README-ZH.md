@@ -122,7 +122,7 @@ python evaluation.py
 
 ## 3. 接入自有数据集
 
-仓库随附的 `forecast_eval_set_example.db` 是由 `futurex-ai/Futurex-Past` 生成的 SQLite 源库。它只有一张 `test_cases` 表，包含七列：`id`、`choice_type`、`question_type`、`event`、`options`、`answer` 与 `end_time`。该表含 357 行清洗后的样本，日期为 2026-03-19 至 2026-06-09：138 行 `yes_no`、10 行 `binary_named`、209 行 `multiple_choice`；其中 41 行 `multiple_choice` 是多答案题。
+仓库随附的 `forecast_eval_set_example.db` 是由 `futurex-ai/Futurex-Past` 生成的 SQLite 源库。它只有一张 `test_cases` 表，包含七列：`id`、`choice_type`、`question_type`、`event`、`options`、`answer` 与 `end_time`。该表含 300 道精选 Level 1/2 题，日期为 2026-03-19 至 2026-09-22，包括 130 道二选一（是否题或两个具名选项）、130 道至少三个选项的多选一，以及 40 道多选多。体育和电竞合计 54 道，占 18%。
 
 接入其他语料时，先创建同样七列的 SQLite 表，再在 `.env` 中指向 `SOURCE_DB` 与 `SOURCE_TABLE`。源库不需要 `dataset_metadata`；缺少该表时，loader 使用 `forecast_eval.prompts.DEFAULT_PROMPT_TEMPLATES`。只有当数据集需要携带自己的 11 个 prompt-template 键时，才添加 `dataset_metadata.features_json.prompt_reconstruction`。
 

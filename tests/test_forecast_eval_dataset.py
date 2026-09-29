@@ -12,6 +12,7 @@ import pytest
 from forecast_eval import db as dbmod
 from forecast_eval import loader
 from forecast_eval.config import Settings
+from forecast_eval.parser import parse_answer, parse_gt
 from forecast_eval.prompts import DEFAULT_PROMPT_TEMPLATES, render_user_prompt
 from forecast_eval.types import QFilter, Question
 from scripts.build_forecast_eval_set import build_rows, validate_database
@@ -162,6 +163,37 @@ def test_source_rows_with_truncated_event_dates_are_dropped() -> None:
     )
 
     assert rows == []
+
+
+@pytest.mark.parametrize("prefix", ["\\", "\\\\"])
+@pytest.mark.parametrize("truth", ["B", "Yes"])
+def test_boxed_source_ground_truth_round_trips(prefix: str, truth: str) -> None:
+    prompt = (
+        'The event to be predicted: "Clean sample '
+        '(resolved around 2026-08-18 (GMT+8)).\n'
+    )
+    if truth == "B":
+        prompt += 'A. the outcome be Alpha\nB. the outcome be Beta"\n'
+    else:
+        prompt += '\\boxed{Yes} or \\boxed{No}'
+
+    rows = build_rows(
+        [{
+            "id": "boxed_truth",
+            "level": 1,
+            "end_time": "2026-08-18",
+            "title": "Clean sample",
+            "prompt": prompt,
+            "ground_truth": repr([prefix + "boxed{" + truth + "}"]),
+        }],
+        min_end_date="2026-06-10",
+        allow_drop_bad=False,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["answer"] == ("B" if truth == "B" else "A")
+    question = Question(**rows[0])
+    assert parse_answer("\\boxed{" + truth + "}", question) == parse_gt(question.answer)
 
 
 def test_default_source_table_tracks_bundled_dataset(monkeypatch) -> None:
