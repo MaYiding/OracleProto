@@ -197,3 +197,27 @@ If you use this project in your research, please cite our paper:
 ```
 
 ---
+
+## Collect raw predictions with fixed reasoning profiles
+
+`MODEL_PROFILES` maps experiment-arm IDs to provider model IDs and explicit reasoning parameters. `MODELS` lists the arm IDs. Keep `TAVILY_MAX_RESULTS=5`, `REACT_MAX_SEARCH_CALLS=4`, `REACT_MAX_STEPS=6`, and `SAMPLING_N=3` for the paper collection budget. A provider-default arm has no declared effort and remains distinct from an explicit `none` or `high` arm.
+
+Set `SCORE_ANSWERS=false` and invoke `python evaluation.py --skip-analysis` to collect answers without computing correctness or metrics. `WRITE_REQUEST_AUDIT=true` keeps request attempts and responses inside each model DB; `REQUIRE_HEALTHY_RETRIEVAL=true` stops collection if search or the detector cannot fulfill the retrieval contract. Resuming requires the same source, prompts, profile parameters, and collection budgets.
+
+`PROMPT_TEMPLATE_STYLE=shared` explicitly selects a dataset with one shared outer template; the default `typed` requires the four question-type templates. `python scripts/collect_forecast_panel.py run` runs the prepared continuation plan in small batches, prioritizing cheaper models. `COLLECTION_MODEL` and `COLLECTION_SAMPLE_LIMIT` restrict dispatch without changing sample budgets. The reasoning expansion is prepared separately and waits for additional quota.
+
+To tune collection throughput, atomically replace `runs/collection_300/dispatch_control.json` with concurrency overrides, for example `{"LEAK_DETECTOR_CONCURRENCY": 10}`. The collector reads them before the next batch. `SIGTERM` requests a stop after the current batch finishes; the same run command resumes pending slots. Effective settings are retained in the run directory's `dispatches.jsonl`.
+
+Delegated profiles can be excluded from the local queue with `runs/collection_300/local_queue_exclusions.json`, specifying `run_id` and `profiles`. The exclusion is checked before every batch; the run directory's `local_queue_state.json` records the startup queue and PID. Remaining delegated work keeps the phase status `local_queue_complete_pending_delegation`.
+
+`COLLECTION_RETAIN_MODEL_REFUSALS=true` preserves forecast-provider content refusals and continues other slots. It requires request auditing and skips retained refusals on resume. The catalog reports them separately from predictions; other terminal errors still stop strict collection.
+
+`LEAK_DETECTOR_RESPONSE_FORMAT=json_object` requests valid JSON from a supporting detector endpoint. `python scripts/catalog_collection.py` links reference and collected samples in `runs/collection_300/catalog.json` and exports observations with consistent field names, retaining source strata and raw values without scoring. Its coverage checklist identifies every pending model/question/sample slot. The observation export uses lossless gzip compression.
+
+`LEAK_DETECTOR_DROP_CONTENT_POLICY=true` drops pages that the detector provider refuses to process. Their verdict remains `failed:content_policy`, with the raw page and rejection retained. Other detector failures still stop strict collection. This option requires its own collection stratum.
+
+The 300-question collection sets `LEAK_DETECTOR_MAX_TOKENS=2048`. A different detector output cap requires a separate run directory; `COLLECTION_REFERENCE_DBS` can reuse completed samples from a stratum with a lower cap while retaining both configurations.
+
+`python scripts/collect_forecast_panel.py plan --phase repair` prepares isolated retries for recorded reference failures. `MODEL_SAMPLE_INDICES` restricts each question to its failed sample slots, preserving completed samples and the declared sampling count. The repair run shares the collection lock and can start once the active collector releases it.
+
+The anchored panel workflow uses `python scripts/prepare_collection.py`, `python scripts/collect_forecast_panel.py plan`, `python scripts/probe_collection.py`, and `python scripts/collect_forecast_panel.py run`. Its private plan and inventory live under `runs/collection_300/`; `python scripts/collect_forecast_panel.py status` reports collection counts without scoring. API credentials remain in `.env`.

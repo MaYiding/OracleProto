@@ -18,14 +18,62 @@ import json
 import re
 import sqlite3
 import time
+import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 from .config import Settings
+from .errors import CollectionBlockedError
 
 
 SCHEMA_VERSION = 5
+
+
+_audit_context: ContextVar[dict[str, Any] | None] = ContextVar("request_audit", default=None)
+
+
+@contextmanager
+def capture_requests(conn: sqlite3.Connection, *, settings: Settings, run_id: str,
+                     model: str, question_id: str, sample_idx: int):
+    """Bind concurrent HTTP calls to one durable sample attempt."""
+    context = None
+    if getattr(settings, "WRITE_REQUEST_AUDIT", True):
+        context = dict(conn=conn, run_id=run_id, model=model, question_id=question_id,
+                       sample_idx=sample_idx, attempt_id=uuid.uuid4().hex,
+                       secrets=[settings.LLM_API_KEY, settings.LEAK_DETECTOR_API_KEY,
+                                *settings.TAVILY_API_KEY])
+    token = _audit_context.set(context)
+    try:
+        yield
+    finally:
+        _audit_context.reset(token)
+
+
+def audit_event(kind: str, payload: Any, *, request_id: str | None = None) -> str:
+    """Append an event immediately, including failed and interrupted attempts."""
+    request_id = request_id or uuid.uuid4().hex
+    context = _audit_context.get()
+    if context is None:
+        return request_id
+    if hasattr(payload, "model_dump"):
+        payload = payload.model_dump(mode="json")
+    encoded = json.dumps(payload, ensure_ascii=False, default=str)
+    for secret in context["secrets"]:
+        if secret:
+            encoded = encoded.replace(secret, "<redacted>")
+    try:
+        context["conn"].execute(
+            "INSERT INTO request_events (run_id, model, question_id, sample_idx, "
+            "attempt_id, request_id, kind, payload, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (context["run_id"], context["model"], context["question_id"],
+             context["sample_idx"], context["attempt_id"], request_id, kind, encoded, utcnow_iso()),
+        )
+    except sqlite3.Error as exc:
+        raise CollectionBlockedError("request audit could not be persisted") from exc
+    return request_id
 
 
 # ---------- Per-sample column definitions ----------
@@ -112,6 +160,21 @@ CREATE TABLE IF NOT EXISTS schema_version (
     version    INTEGER PRIMARY KEY,
     applied_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS request_events (
+    event_id INTEGER PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    question_id TEXT NOT NULL,
+    sample_idx INTEGER NOT NULL,
+    attempt_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_request_events_sample
+ON request_events(question_id, sample_idx, attempt_id);
 
 CREATE TABLE IF NOT EXISTS questions (
     id            TEXT PRIMARY KEY,
@@ -441,7 +504,40 @@ def snapshot_settings(settings: Settings) -> dict[str, Any]:
             redacted[key] = {m: d.isoformat() for m, d in settings.MODEL_TRAINING_CUTOFFS.items()}
         else:
             redacted[key] = value
+    profiles = raw.get("MODEL_PROFILES", {})
+    if profiles:
+        redacted["inference_profiles_hash"] = hashlib.sha256(
+            json.dumps(profiles, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
     return redacted
+
+
+def collection_contract(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Fields that can change which evidence or answers a sample produces."""
+    prefixes = ("REACT_", "MODEL_", "TAVILY_")
+    names = {
+        "MODELS", "LLM_BASE_URL", "LLM_MAX_TOKENS", "LLM_TEMPERATURE", "LLM_TOP_P",
+        "LLM_REASONING_MODEL_PATTERNS", "SAMPLING_N", "BELIEF_PROTOCOL", "SCORE_ANSWERS",
+        "ENABLE_WEB_SEARCH", "ENABLE_SEARCH_LEAK_FILTER", "LEAK_DETECTOR_BASE_URL",
+        "WRITE_MESSAGES_TRACE", "WRITE_REQUEST_AUDIT", "REQUIRE_HEALTHY_RETRIEVAL",
+        "LEAK_DETECTOR_MODEL", "LEAK_DETECTOR_REASONING_EFFORT", "LEAK_DETECTOR_TEMPERATURE",
+        "LEAK_DETECTOR_MAX_TOKENS", "LEAK_DETECTOR_FAIL_ACTION", "leak_detector_prompt_hash",
+        "PROMPT_TEMPLATE_STYLE",
+        "LEAK_DETECTOR_RESPONSE_FORMAT",
+        "LEAK_DETECTOR_DROP_CONTENT_POLICY",
+    }
+    excluded = {"TAVILY_API_KEY", "TAVILY_KEY_COOLDOWN_S"}
+    if not snapshot.get("MODEL_SAMPLE_INDICES"):
+        excluded.add("MODEL_SAMPLE_INDICES")
+    if not snapshot.get("LEAK_DETECTOR_DROP_CONTENT_POLICY"):
+        excluded.add("LEAK_DETECTOR_DROP_CONTENT_POLICY")
+    return {key: value for key, value in snapshot.items()
+            if (key in names or key.startswith(prefixes)) and key not in excluded}
+
+
+def compute_collection_contract_hash(snapshot: dict[str, Any]) -> str:
+    canonical = json.dumps(collection_contract(snapshot), sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 # ---------- Model slug safety ----------
@@ -612,12 +708,15 @@ def finish_run_meta(
 def load_completed_samples(
     conn: sqlite3.Connection,
     sampling_n: int,
+    *,
+    retain_model_refusals: bool = False,
 ) -> set[tuple[str, int]]:
     """Return {(question_id, sample_idx)} already accounted for.
 
     A sample counts as accounted-for if its `s{i}_created_at` is set AND its
     `s{i}_error` is either NULL (normal completion) or 'skipped_training_cutoff'
-    (actively filtered). Any other `s{i}_error` value will be retried.
+    (actively filtered). Opting into refusal retention also accounts for
+    'content_policy', without treating it as a prediction. Other errors retry.
     """
     done: set[tuple[str, int]] = set()
     for i in range(sampling_n):
@@ -627,8 +726,9 @@ def load_completed_samples(
             f"""
             SELECT question_id FROM run_results
             WHERE {created} IS NOT NULL
-              AND ({err} IS NULL OR {err} = 'skipped_training_cutoff')
-            """
+              AND ({err} IS NULL OR {err} = 'skipped_training_cutoff'
+                   OR (? AND {err} = 'content_policy'))
+            """, (retain_model_refusals,)
         ).fetchall()
         for r in rows:
             done.add((r["question_id"], i))

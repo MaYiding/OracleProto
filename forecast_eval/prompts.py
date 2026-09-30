@@ -100,6 +100,9 @@ DEFAULT_PROMPT_TEMPLATES: dict[str, str] = {
 
 
 REQUIRED_PROMPT_TEMPLATE_KEYS: tuple[str, ...] = tuple(DEFAULT_PROMPT_TEMPLATES)
+SHARED_PROMPT_TEMPLATE_KEYS: tuple[str, ...] = tuple(
+    key for key in REQUIRED_PROMPT_TEMPLATE_KEYS if not key.endswith("_prompt_template")
+) + ("prompt_template",)
 
 
 # Lowercase / symbolic labels are easily eaten by markdown (backticks /
@@ -589,6 +592,7 @@ def render_user_prompt(
     q: Question,
     templates: dict[str, str],
     *,
+    template_style: str = "typed",
     budget_awareness_protocol: str | None = None,
     reflection_protocol: str | None = None,
     belief_protocol: str | None = None,
@@ -646,12 +650,21 @@ def render_user_prompt(
     else:
         raise ValueError(f"unknown question_type: {q.question_type!r}")
 
+    if template_style not in ("typed", "shared"):
+        raise ValueError(f"unknown template style: {template_style}")
+    if template_style == "shared":
+        prompt_template_key = "prompt_template"
     prompt_template = templates[prompt_template_key]
-    _assert_outer_template_contract(
-        prompt_template_key,
-        prompt_template,
-        requires_outcomes_block=requires_outcomes_block,
-    )
+    if template_style == "typed":
+        _assert_outer_template_contract(
+            prompt_template_key,
+            prompt_template,
+            requires_outcomes_block=requires_outcomes_block,
+        )
+    else:
+        required = ("agent_role", "event", "end_time", "outcomes_block", "output_format", "guidance")
+        if any("{" + slot + "}" not in prompt_template for slot in required):
+            raise ValueError("shared prompt_template missing required slot")
     _assert_output_format_contract(q, output_format)
 
     rendered = prompt_template.format(
@@ -662,7 +675,7 @@ def render_user_prompt(
         output_format=output_format,
         guidance=templates["guidance"],
     )
-    if rendered.count(_FINAL_FORMAT_REQUIREMENT) != 1:
+    if template_style == "typed" and rendered.count(_FINAL_FORMAT_REQUIREMENT) != 1:
         raise ValueError(
             "rendered prompt must contain exactly one final-answer format requirement"
         )

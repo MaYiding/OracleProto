@@ -6,6 +6,7 @@ from enum import StrEnum
 from typing import Any, Optional
 
 import httpx
+from openai import APIConnectionError
 
 
 class ErrorKind(StrEnum):
@@ -25,6 +26,10 @@ class AuthError(Exception):
     the writer, and exits with a non-zero status. Content of the run_results
     rows depends on runner policy.
     """
+
+
+class CollectionBlockedError(Exception):
+    """Collection cannot preserve its retrieval or persistence contract."""
 
 
 # Content-policy needles for HTTP 400 bodies.
@@ -86,17 +91,14 @@ def _body_matches(exc: BaseException, needles: tuple[str, ...]) -> bool:
 def classify(exc: BaseException) -> ErrorKind:
     """Map an outgoing-HTTP exception to a coarse ErrorKind for retry decisions.
 
-    Network family covers the full httpx transient-failure set: connect /
-    read / write / pool timeouts plus `RemoteProtocolError` (server hung up
-    mid-response) — all of these are bona-fide network blips that earn a
-    retry, not data errors that should fail the sample. Older versions of
-    this function only listed `ConnectError / ReadTimeout / ConnectTimeout /
-    WriteTimeout`, which dropped `RemoteProtocolError` into `UNKNOWN` and the
-    sample failed with no retry.
+    The network family includes httpx transport failures and the OpenAI SDK
+    connection/timeout wrappers. A transport retry keeps the current model
+    context, including search results already obtained for this sample.
     """
     if isinstance(
         exc,
         (
+            APIConnectionError,
             httpx.ConnectError,
             httpx.ReadTimeout,
             httpx.ConnectTimeout,

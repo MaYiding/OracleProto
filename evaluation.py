@@ -160,6 +160,8 @@ def _write_manifest(
         "sampling_n": settings.SAMPLING_N,
         "models": virtual_models,
         "model_files": model_files,
+        "model_profiles": {name: profile.model_dump(mode="json") for name, profile in settings.MODEL_PROFILES.items()},
+        "inference_profiles_hash": dbmod.snapshot_settings(settings).get("inference_profiles_hash"),
         "model_training_cutoffs": {
             m: d.isoformat() for m, d in settings.MODEL_TRAINING_CUTOFFS.items()
         },
@@ -244,8 +246,6 @@ def _init_model_db(
     """
     conn = dbmod.connect(db_path)
     dbmod.init_schema(conn, cell_settings.SAMPLING_N)
-    templates = loader.sync_prompt_templates(source_path, conn)
-    questions = loader.sync_questions(source_path, conn, filters, table=cell_settings.SOURCE_TABLE)
     cutoff = cell_settings.MODEL_TRAINING_CUTOFFS.get(real_model)
     config_snapshot = dbmod.snapshot_settings(cell_settings)
     # search-leak-filter-v1: detector fingerprint triplet (enabled / model /
@@ -263,6 +263,25 @@ def _init_model_db(
             leak_filter._compute_prompt_hash() if leak_enabled else ""
         ),
     }
+    existing = conn.execute("SELECT * FROM run_meta").fetchone()
+    if existing is not None:
+        expected = {
+            "run_id": run_id, "model": virtual_model, "sampling_n": cell_settings.SAMPLING_N,
+            "source_db_hash": source_db_hash, "metadata_hash": metadata_hash,
+            "prompt_templates_hash": prompt_templates_hash,
+            "reflection_protocol_hash": reflection_protocol_hash,
+            "belief_protocol_hash": belief_protocol_hash,
+        }
+        mismatch = [key for key, value in expected.items() if existing[key] != value]
+        if dbmod.collection_contract(json.loads(existing["config_snapshot"])) != dbmod.collection_contract(config_snapshot):
+            mismatch.append("collection_contract")
+        if json.loads(existing["filters_snapshot"]) != filters_snapshot:
+            mismatch.append("filters_snapshot")
+        if mismatch:
+            conn.close()
+            raise ValueError(f"resume would mix different contracts: {', '.join(mismatch)}")
+    templates = loader.sync_prompt_templates(source_path, conn, template_style=cell_settings.PROMPT_TEMPLATE_STYLE)
+    questions = loader.sync_questions(source_path, conn, filters, table=cell_settings.SOURCE_TABLE)
     grid_origin = {
         "real_model": real_model,
         "R": R,
@@ -345,7 +364,7 @@ async def _run_async(
     # per-model DB below will re-sync the questions into its own file.
     scratch = dbmod.connect(":memory:")
     dbmod.init_schema(scratch, settings.SAMPLING_N)
-    templates_preview = loader.sync_prompt_templates(source_path, scratch)
+    templates_preview = loader.sync_prompt_templates(source_path, scratch, template_style=settings.PROMPT_TEMPLATE_STYLE)
     questions_preview = loader.sync_questions(source_path, scratch, filters, table=settings.SOURCE_TABLE)
     scratch.close()
 
@@ -462,6 +481,18 @@ async def _run_async(
             logger.error("AUTH error, aborting run: {}", e)
             return 4
 
+        if stats.aborted:
+            state = json.loads(manifest_path.read_text())
+            state["status"] = "blocked"
+            state["block_reason"] = stats.abort_reason
+            manifest_path.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True))
+            logger.error("[run={}] incomplete; resume after resolving the blocker", run_id)
+            return 4
+        if stats.deferred:
+            state = json.loads(manifest_path.read_text())
+            state.update(status="partial", remaining_samples=stats.deferred)
+            manifest_path.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True))
+            return 6
         finished_at = dbmod.utcnow_iso()
         _finalise_manifest(manifest_path, finished_at)
 

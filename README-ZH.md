@@ -179,3 +179,27 @@ python -m forecast_eval.analysis runs/{run_id}
 ```
 
 ---
+
+## 使用固定思考配置采集原始预测
+
+`MODEL_PROFILES` 将实验配置 ID 映射到供应商模型 ID 与明确的思考参数；`MODELS` 列出实验配置 ID。论文采集预算固定为 `TAVILY_MAX_RESULTS=5`、`REACT_MAX_SEARCH_CALLS=4`、`REACT_MAX_STEPS=6`、`SAMPLING_N=3`。供应商默认模式不声明 effort，与显式 `none` 或 `high` 配置分别保存。
+
+设置 `SCORE_ANSWERS=false` 并执行 `python evaluation.py --skip-analysis`，即可采集答案而不计算正确性或指标。`WRITE_REQUEST_AUDIT=true` 将请求尝试与响应保存在每个模型 DB 内；`REQUIRE_HEALTHY_RETRIEVAL=true` 在搜索或过滤模型无法履行检索契约时停止采集。恢复运行要求题库、提示词、思考配置及采集预算一致。
+
+`PROMPT_TEMPLATE_STYLE=shared` 显式选择共用一个外层模板的题库；默认 `typed` 要求四个按题型区分的模板。`python scripts/collect_forecast_panel.py run` 按准备好的续跑计划分小批采集，优先运行便宜模型。`COLLECTION_MODEL` 与 `COLLECTION_SAMPLE_LIMIT` 限制调度范围，不改变单个样本预算。思考档位扩展单独准备，等待补充额度。
+
+调整采集吞吐时，原子替换 `runs/collection_300/dispatch_control.json` 中的并发覆盖值，例如 `{"LEAK_DETECTOR_CONCURRENCY": 10}`。采集器在下一小批开始前读取。`SIGTERM` 请求在当前小批完成后停止；用相同运行命令续跑待完成样本槽。实际设置保存在运行目录的 `dispatches.jsonl`。
+
+交给其他执行者的配置可通过 `runs/collection_300/local_queue_exclusions.json` 从本机队列排除，文件指定 `run_id` 和 `profiles`。每个小批前检查排除列表；运行目录的 `local_queue_state.json` 记录启动队列及 PID。仍有委派工作时，批次状态保持 `local_queue_complete_pending_delegation`。
+
+`COLLECTION_RETAIN_MODEL_REFUSALS=true` 留存预测供应商的内容拒绝，并继续其他样本槽。该开关要求启用请求审计，恢复时跳过已留存的拒绝。catalog 将拒绝与预测分开统计；其他终止性错误仍停止严格采集。
+
+`LEAK_DETECTOR_RESPONSE_FORMAT=json_object` 向支持该选项的过滤模型接口请求有效 JSON。`python scripts/catalog_collection.py` 在 `runs/collection_300/catalog.json` 中关联参考样本和采集样本，按一致的字段名导出观测记录，保留来源分层和原始值，不计算评分。其中的覆盖清单标识每个尚未完成的模型、题目和采样序号组合。观测导出采用 gzip 无损压缩。
+
+`LEAK_DETECTOR_DROP_CONTENT_POLICY=true` 丢弃过滤模型供应商拒绝处理的页面。判定保留为 `failed:content_policy`，原始页面与拒绝记录一并保存。其他过滤错误仍会停止严格采集。此选项使用独立采集分层。
+
+300 题采集设置 `LEAK_DETECTOR_MAX_TOKENS=2048`。不同过滤输出上限使用独立运行目录；`COLLECTION_REFERENCE_DBS` 可复用较低上限分层中已完成的样本，同时保留两种配置。
+
+`python scripts/collect_forecast_panel.py plan --phase repair` 为参考数据中已记录的失败准备独立补录。`MODEL_SAMPLE_INDICES` 将每题限制到失败样本槽，保留已完成样本和声明的采样次数。补录运行共用采集锁，在当前采集器释放锁后启动。
+
+保留原题的面板流程依次使用 `python scripts/prepare_collection.py`、`python scripts/collect_forecast_panel.py plan`、`python scripts/probe_collection.py` 与 `python scripts/collect_forecast_panel.py run`。本地计划和来源清单位于 `runs/collection_300/`；`python scripts/collect_forecast_panel.py status` 只报告采集数量，不评分。API 凭据保存在 `.env`。

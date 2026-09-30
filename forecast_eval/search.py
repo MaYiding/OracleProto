@@ -8,6 +8,8 @@ import httpx
 from loguru import logger
 
 from .config import Settings
+from .db import audit_event
+from .errors import CollectionBlockedError
 from .tavily_keys import AllKeysExhausted, TavilyKeyPool, get_pool
 
 
@@ -47,6 +49,7 @@ class SearchResult:
     # field so dataclass field-ordering rules stay satisfied. NOT exposed via
     # to_llm_payload() — the audit dict is for search_calls JSON only.
     audit: dict[str, Any] | None = None
+    raw_response: dict[str, Any] | None = None
 
     @property
     def ok(self) -> bool:
@@ -127,7 +130,7 @@ def _parse_tavily_response(
                 raw_content=rc_str,
             )
         )
-    return SearchResult(query=query, end_date=end_date, answer=answer, results=items)
+    return SearchResult(query=query, end_date=end_date, answer=answer, results=items, raw_response=data)
 
 
 def _build_request_payload(
@@ -170,13 +173,20 @@ async def _single_request(
     settings: Settings,
     api_key: str,
 ) -> httpx.Response:
-    return await client.post(
-        TAVILY_ENDPOINT,
-        json=_build_request_payload(
-            query=query, end_date=end_date, settings=settings, api_key=api_key
-        ),
-        timeout=settings.LLM_TIMEOUT_S,
-    )
+    payload = _build_request_payload(query=query, end_date=end_date, settings=settings, api_key=api_key)
+    request_id = audit_event("search.request", {
+        "endpoint": TAVILY_ENDPOINT, "body": {k: v for k, v in payload.items() if k != "api_key"},
+    })
+    try:
+        response = await client.post(TAVILY_ENDPOINT, json=payload, timeout=settings.LLM_TIMEOUT_S)
+    except asyncio.CancelledError:
+        audit_event("search.cancelled", {}, request_id=request_id)
+        raise
+    except Exception as exc:
+        audit_event("search.error", {"type": type(exc).__name__, "message": str(exc)}, request_id=request_id)
+        raise
+    audit_event("search.response", {"status": response.status_code, "body": response.text}, request_id=request_id)
+    return response
 
 
 async def tavily_search(
@@ -231,6 +241,8 @@ async def tavily_search(
             try:
                 api_key = await pool.acquire()
             except AllKeysExhausted as e:
+                if getattr(settings, "REQUIRE_HEALTHY_RETRIEVAL", False):
+                    raise CollectionBlockedError("Tavily key pool exhausted; collection paused") from e
                 last_error_kind = "all_keys_exhausted"
                 last_error_message = str(e)
                 logger.warning("tavily {}", last_error_message)
@@ -293,7 +305,7 @@ async def tavily_search(
                                 settings=settings,
                             )
                         return result
-                elif status in _AUTH_STATUS:
+                elif status in _AUTH_STATUS or status in (432, 433):
                     await pool.report_failure(api_key, "auth")
                     last_error_kind = "auth"
                     last_error_message = f"HTTP {status}: {resp.text[:500]}"
@@ -333,6 +345,8 @@ async def tavily_search(
         if owns_client:
             await client.aclose()
 
+    if getattr(settings, "REQUIRE_HEALTHY_RETRIEVAL", False):
+        raise CollectionBlockedError(f"Tavily unavailable: {last_error_kind}; collection paused")
     return SearchResult(
         query=query,
         end_date=end_date,

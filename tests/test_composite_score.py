@@ -245,6 +245,7 @@ def test_default_weights_sum_to_one() -> None:
 
 
 def _settings_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
     monkeypatch.setenv("LLM_API_KEY", "test-key")
     monkeypatch.setenv("MODELS", "m1")
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")

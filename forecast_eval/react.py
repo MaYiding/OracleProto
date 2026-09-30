@@ -146,6 +146,10 @@ def _record_search_call(
                 "detector_verdicts": list(audit["detector_verdicts"]),
                 "detector_latency_ms": int(audit["detector_latency_ms"]),
                 "detector_error_kind": audit["detector_error_kind"],
+                "detector_reasons": list(audit.get("detector_reasons", [])),
+                "results_raw": audit.get("results_raw", []),
+                "raw_response": result.raw_response,
+                "visible_payload": result.to_llm_payload(),
             }
         )
         return
@@ -196,6 +200,7 @@ async def run_react(
     user_prompt = render_user_prompt(
         q,
         templates,
+        template_style=settings.PROMPT_TEMPLATE_STYLE,
         budget_awareness_protocol=budget_awareness,
         reflection_protocol=REFLECTION_PROTOCOL if settings.REACT_REFLECTION_PROTOCOL else None,
         belief_protocol=BELIEF_PROTOCOL if belief_enabled else None,
@@ -544,12 +549,14 @@ async def run_react(
         final_answer_retry_used = 1
 
     parsed = parse_answer(final_raw, q)
-    try:
-        gt = parse_gt(q.answer)
-    except ValueError:
-        logger.error("question {} has invalid answer field: {!r}", q.id, q.answer)
-        gt = frozenset()
-    correct = is_correct(parsed, gt) if parsed is not None else None
+    correct = None
+    if getattr(settings, "SCORE_ANSWERS", True):
+        try:
+            gt = parse_gt(q.answer)
+        except ValueError:
+            logger.error("question {} has invalid answer field: {!r}", q.id, q.answer)
+            gt = frozenset()
+        correct = is_correct(parsed, gt) if parsed is not None else None
 
     belief_final, belief_trace, belief_parse_ok = _finalize_belief_fields(
         belief_enabled=belief_enabled, beliefs_per_step=beliefs_per_step

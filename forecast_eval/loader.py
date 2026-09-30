@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .db import utcnow_iso
-from .prompts import DEFAULT_PROMPT_TEMPLATES, REQUIRED_PROMPT_TEMPLATE_KEYS
+from .prompts import DEFAULT_PROMPT_TEMPLATES, REQUIRED_PROMPT_TEMPLATE_KEYS, SHARED_PROMPT_TEMPLATE_KEYS
 from .types import QFilter, Question
 
 
@@ -46,6 +46,8 @@ def _read_features_json(src_conn: sqlite3.Connection) -> dict[str, Any]:
 def sync_prompt_templates(
     source_db: str | Path,
     results_conn: sqlite3.Connection,
+    *,
+    template_style: str = "typed",
 ) -> dict[str, str]:
     """Flatten source prompt templates into
     `results.db.prompt_templates` and return it as a dict for in-memory use.
@@ -70,10 +72,13 @@ def sync_prompt_templates(
         else:
             flat[key] = json.dumps(value, ensure_ascii=False, sort_keys=True)
 
-    missing = [k for k in REQUIRED_PROMPT_TEMPLATE_KEYS if k not in flat]
+    if template_style not in ("typed", "shared"):
+        raise ValueError(f"unknown template style: {template_style}")
+    required = SHARED_PROMPT_TEMPLATE_KEYS if template_style == "shared" else REQUIRED_PROMPT_TEMPLATE_KEYS
+    missing = [k for k in required if k not in flat]
     if missing:
         raise ValueError(f"prompt_reconstruction missing required keys: {missing}")
-    unexpected = [k for k in flat if k not in REQUIRED_PROMPT_TEMPLATE_KEYS]
+    unexpected = [k for k in flat if k not in required]
     if unexpected:
         raise ValueError(f"prompt_reconstruction contains unknown keys: {unexpected}")
 
