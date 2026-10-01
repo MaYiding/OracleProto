@@ -515,14 +515,7 @@ async def _run_async(
         logger.info("[run={}] --skip-analysis: analysis/ not generated", run_id)
     else:
         try:
-            written = analysis.run_analysis(
-                run_dir,
-                # Pass through the difficulty-weighted composite settings from
-                # .env to the analysis layer; the analysis module does not
-                # read .env itself, evaluation supplies them.
-                composite_weights=settings.COMPOSITE_WEIGHTS,
-                composite_overrides=settings.COMPOSITE_WEIGHT_OVERRIDES,
-            )
+            written = analysis.run_analysis(run_dir)
             logger.info(
                 "[run={}] analysis written: {}",
                 run_id,

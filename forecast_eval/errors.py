@@ -32,6 +32,14 @@ class CollectionBlockedError(Exception):
     """Collection cannot preserve its retrieval or persistence contract."""
 
 
+class AnalysisContractError(ValueError):
+    """Stored observations or analysis inputs violate the scoring contract."""
+
+
+class AnalysisIncompleteError(AnalysisContractError):
+    """A declared evaluation panel has missing or failed sample slots."""
+
+
 # Content-policy needles for HTTP 400 bodies.
 # `_body_matches` runs case-insensitive substring matching on `_error_body`,
 # so needles MUST be lowercase ASCII. Update only here when a new provider's

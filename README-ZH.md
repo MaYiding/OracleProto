@@ -63,7 +63,7 @@ forecast_eval/                       # 核心代码
 ├─ leak_filter.py                    # 检索内容审计
 ├─ llm.py                            # OpenAI 兼容客户端；强制禁止供应商原生浏览
 ├─ search.py                         # Tavily 包装
-├─ analysis/                         # 评分与诊断：accuracy、FSS、BI、composite、behavior
+├─ analysis/                         # 固定 Score、选项与重复作答诊断
 ├─ prompts.py / parser.py            # 输入渲染器 R / 输出解析器 Ψ
 ├─ types.py / errors.py / config.py  # 数据模型 / 类型化异常 / Settings
 ├─ db.py / loader.py                 # SQLite schema 迁移 / 数据集同步
@@ -130,23 +130,31 @@ python evaluation.py
 
 ## 4. 输出
 
-```
+主指标 **Score** 是已得题目分数占试卷满分的百分比。判断题、二选一各 1 分，多选一 2 分，多选多 3 分。前三类按答案完全匹配计分；多选多得分为 $`3\cdot 2TP/(2TP+FP+FN)`$，只有答案完全正确才能拿满 3 分。
+
+三次重复实验先对每题三次得分取平均，再将各题平均分相加，除以整张试卷的满分。全部答对时 Score 为 100。各题型的贡献由题数和单题分值决定，不再另行拟合题型权重。
+
+```text
 runs/{run_id}/
-├─ manifest.json          # 运行级元数据与哈希链
-├─ db/{model_slug}.db     # 每模型一份 SQLite，可独立重放
-├─ analysis/              # 由原始 DB 重算的 CSV/JSON
+├─ manifest.json
+├─ db/{model_slug}.db
+├─ analysis/score/         # Score、诊断、覆盖率、scoring_meta.json
 └─ logs/{run_id}.log
 ```
 
-DB 仅存原始观测。每一项聚合（$`\text{pass@1}`$、FSS、BI、composite 等）由 `forecast_eval/analysis/` 重算，该步骤在 `evaluation.py` 末尾自动运行，亦可独立调用：
+原始采集及委派结果全部齐备后执行：
 
 ```bash
-python -m forecast_eval.analysis runs/{run_id}
+python -B -m forecast_eval.analysis runs/{run_id}
 ```
 
-当运行是虚拟 panel（`manifest.is_virtual_panel = true`），analysis 路径额外产出 panel-wide 统计资料。字段级 schema 见 [`panels/README.md`](./panels/README-ZH.md)，最小可工作骨架见 [`panels/example.json`](./panels/example.json)。
+分批采集的统一入口是 `python -B -m forecast_eval.analysis runs/collection_300/catalog.json --profiles PROFILE_ID ...`。先由采集会话刷新 catalog，再明确选定已完成的配置；catalog 可能同时列出尚未开始的 reasoning 配置。评分会校验题库与观测导出的哈希，保留参考、续跑、补录和过滤分层。结果写入 `runs/collection_300/analysis/score/`。
 
----
+`score_report.md` 与 `score_summary.csv` 报告共同题目上的模型表现。`score_by_type.csv` 列出四类题型；`selection_diagnostics.csv` 区分错选、漏选和替换；`score_by_trial.csv` 及 pass/vote 列描述重复作答。指标取舍与研究依据见 [DESIGN §4](DESIGN-ZH.md#4-分层评测)，输出字段见 [FRAME §9](FRAME-ZH.md#9-指标)。
+
+即使 `correct` 为 NULL，评分器也会读取已存答案重新判分，不回写原始 DB。声明的参考 DB 按模型、题目、采样序号联合读取，并检查冲突。缺样本或基础设施失败会以退出码 2 阻止正式评分，同时生成覆盖报告。`--allow-incomplete` 允许查看诊断，但受影响的分数仍留空。模型拒绝与无效答案计零分；因 cutoff 排除的题目不计入。固定评分契约、来源配置哈希、观测与实现指纹写入 `scoring_meta.json`。
+
+默认只为 Score 计算 2,000 次共享的题目 bootstrap。检查覆盖情况时可用 `--bootstrap-iterations 0` 跳过区间。FSS、拟合的综合权重、排名稳定性和概率校准不属于这份报告。`analysis/` 根目录中的文件使用各自的契约；本次评分以 `analysis/score/scoring_meta.json` 的产物列表为准。
 
 ## 5. 联系与合作
 

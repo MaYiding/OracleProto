@@ -62,7 +62,7 @@ forecast_eval/                       # core package
 ├─ leak_filter.py                    # retrieval-content auditor
 ├─ llm.py                            # OpenAI-compatible client; enforces no provider-side browsing
 ├─ search.py                         # Tavily wrapper
-├─ analysis/                         # scoring and diagnostics: accuracy, FSS, BI, composite, behavior
+├─ analysis/                         # fixed Score, selection and repetition diagnostics
 ├─ prompts.py / parser.py            # input renderer R / output parser Ψ
 ├─ types.py / errors.py / config.py  # data models / typed exceptions / Settings
 ├─ db.py / loader.py                 # SQLite schema migrations / dataset sync
@@ -145,25 +145,31 @@ must carry its own eleven prompt-template keys.
 
 ## 4. Outputs
 
-```
+The primary **Score** is the percentage of available question points earned. Yes/no and named binary questions are worth 1 point each; single-answer multiple choice is worth 2; multi-answer multiple choice is worth 3. The first three use exact answers. Multi-answer credit is $`3\cdot 2TP/(2TP+FP+FN)`$. Only an exact answer earns all three points.
+
+With three repetitions, average each question's earned points across its three answers, sum those averages, and divide by the full paper points. A perfect model scores 100. Question counts affect each type's contribution; there is no separate type-weight fitting.
+
+```text
 runs/{run_id}/
-├─ manifest.json          # run-level metadata and hash chain
-├─ db/{model_slug}.db     # one SQLite per model, independently replayable
-├─ analysis/              # CSV/JSON regenerated from the raw DB
+├─ manifest.json
+├─ db/{model_slug}.db
+├─ analysis/score/         # Score, diagnostics, coverage, scoring_meta.json
 └─ logs/{run_id}.log
 ```
 
-The DB stores raw observations only. Every aggregate ($`\text{pass@1}`$, FSS, BI,
-composite, …) is recomputed by `forecast_eval/analysis/`, which runs at the end of
-`evaluation.py` and can also be invoked standalone:
+After raw collection and delegated results are complete, run:
 
 ```bash
-python -m forecast_eval.analysis runs/{run_id}
+python -B -m forecast_eval.analysis runs/{run_id}
 ```
 
-When the run is a virtual panel (`manifest.is_virtual_panel = true`), the analysis path additionally emits the panel-wide statistical envelope. See [`panels/README.md`](./panels/README.md) for the field-by-field schema and [`panels/example.json`](./panels/example.json) for a 2-model template.
+For collection across batches, use `python -B -m forecast_eval.analysis runs/collection_300/catalog.json --profiles PROFILE_ID ...`. Refresh the catalog in the collection workflow and explicitly select completed profiles; the catalog can also contain reasoning profiles that have not started. Scoring checks corpus and observation-export hashes and retains reference, continuation, repair, and detector strata. Output is `runs/collection_300/analysis/score/`.
 
----
+`score_report.md` and `score_summary.csv` report the common-question panel. `score_by_type.csv` shows all four types; `selection_diagnostics.csv` separates extra, missed, and substituted selections; `score_by_trial.csv` and the pass/vote columns describe repeated answers. Definitions and research choices are in [DESIGN §4](DESIGN.md#4-hierarchical-evaluation); output fields are in [FRAME §9](FRAME.md#9-metrics).
+
+The scorer reads stored answers even when `correct` is NULL and never updates raw DBs. Declared reference DBs are joined by model/question/trial with conflict checks. Missing samples or infrastructure failures stop official scoring with exit code 2 and a coverage report. `--allow-incomplete` permits diagnostics while affected scores remain empty. Model refusals and invalid answers earn zero. Cutoff-excluded questions are excluded. The fixed scoring contract, source configuration hashes, observations, and implementation are fingerprinted in `scoring_meta.json`.
+
+The default computes 2,000 shared question bootstrap replicates for Score only. `--bootstrap-iterations 0` skips intervals for a coverage check. FSS, fitted composites, rank stability, and probability calibration are outside this report. Files directly under `analysis/` belong to their own contracts; use the artifact list in `analysis/score/scoring_meta.json`.
 
 ## 5. Contact
 
