@@ -198,7 +198,13 @@ python -B -m forecast_eval.analysis runs/{run_id}
 
 调整采集吞吐时，原子替换 `runs/collection_300/dispatch_control.json` 中的并发覆盖值，例如 `{"LEAK_DETECTOR_CONCURRENCY": 10}`。采集器在下一小批开始前读取。`SIGTERM` 请求在当前小批完成后停止；用相同运行命令续跑待完成样本槽。实际设置保存在运行目录的 `dispatches.jsonl`。
 
+`COLLECTION_EXPENSIVE_CONCURRENCY` 单独设置昂贵配置的采样并发，也支持在小批边界覆盖。`COLLECTION_DRAIN_ON_ERROR=true` 时，终止性失败会停止接收待执行样本，已开始的样本继续完成并留存证据。失败槽位保持未解决状态，采集器等这些样本收尾后停止。
+
 交给其他执行者的配置可通过 `runs/collection_300/local_queue_exclusions.json` 从本机队列排除，文件指定 `run_id` 和 `profiles`。每个小批前检查排除列表；运行目录的 `local_queue_state.json` 记录启动队列及 PID。仍有委派工作时，批次状态保持 `local_queue_complete_pending_delegation`。
+
+`COLLECTION_BATCH_SAMPLES` 控制 3 次采样试跑之后的普通批次大小，默认 60。增大它可以减少批次间等待最后一个慢样本的频率；同时在途的样本数仍受独立并发上限约束。昂贵配置保持每批 15 次，所有批次仍受剩余槽位和搜索额度预留限制。控制文件可在批次边界覆盖此设置。
+
+收到委派结果后，先核对发送方校验清单并确认采集已停止，再将 `delegated_results.json` 中对应项设为 `verified_return`，填写以项目相对路径为键的 `returned_artifacts` SHA-256 映射。catalog 核对固定任务、执行快照、原始日志和推理契约后，将回传运行作为独立来源收录。未经核对的回传仍记为待接收。
 
 `COLLECTION_RETAIN_MODEL_REFUSALS=true` 留存预测供应商的内容拒绝，并继续其他样本槽。该开关要求启用请求审计，恢复时跳过已留存的拒绝。catalog 将拒绝与预测分开统计；其他终止性错误仍停止严格采集。
 

@@ -406,11 +406,12 @@ async def test_dispatch_limit_leaves_pending_samples_and_resume_skips_completed(
     conn.close()
 
 
+@pytest.mark.parametrize("drain", [False, True])
 @pytest.mark.parametrize("retain,error,terminal", [(False, "content_policy", False),
     (True, "content_policy", True), (True, "network", False), (True, "bad_request", False)])
-async def test_model_refusal_retention_preserves_error_and_resume_boundary(tmp_path, monkeypatch, retain, error, terminal):
+async def test_model_refusal_retention_preserves_error_and_resume_boundary(tmp_path, monkeypatch, retain, error, terminal, drain):
     config = settings(SAMPLING_N=1, REQUIRE_HEALTHY_RETRIEVAL=True,
-                      COLLECTION_RETAIN_MODEL_REFUSALS=retain, DB_COMMIT_BATCH=1)
+                      COLLECTION_RETAIN_MODEL_REFUSALS=retain, COLLECTION_DRAIN_ON_ERROR=drain, DB_COMMIT_BATCH=1)
     conn = db.connect(tmp_path / "refused.db")
     db.init_schema(conn, 1)
     question = _yes_no_question()
@@ -514,7 +515,8 @@ async def test_dispatch_tuning_is_applied_between_batches_and_stop_drains(tmp_pa
     monkeypatch.setattr(collect_forecast_panel, "local", lambda path: path)
     (tmp_path / "runs/fixture").mkdir(parents=True)
     control = tmp_path / "dispatch_control.json"
-    control.write_text(json.dumps({"LEAK_DETECTOR_CONCURRENCY": 10, "LLM_MAX_CONCURRENCY": 8}))
+    control.write_text(json.dumps({"LEAK_DETECTOR_CONCURRENCY": 10, "LLM_MAX_CONCURRENCY": 8,
+                                   "COLLECTION_EXPENSIVE_CONCURRENCY": 2}))
     completed = 0
     stop = asyncio.Event()
     configs = []
@@ -525,7 +527,8 @@ async def test_dispatch_tuning_is_applied_between_batches_and_stop_drains(tmp_pa
         assert kwargs["skip_analysis"] is True
         configs.append(config)
         completed += config.COLLECTION_SAMPLE_LIMIT
-        control.write_text(json.dumps({"LEAK_DETECTOR_CONCURRENCY": 15, "LLM_MAX_CONCURRENCY": 10}))
+        control.write_text(json.dumps({"LEAK_DETECTOR_CONCURRENCY": 15, "LLM_MAX_CONCURRENCY": 10,
+                                       "COLLECTION_EXPENSIVE_CONCURRENCY": 3}))
         if stop_after_first:
             stop.set()
         return 0
@@ -537,7 +540,7 @@ async def test_dispatch_tuning_is_applied_between_batches_and_stop_drains(tmp_pa
     assert await collect_forecast_panel.dispatch_batches(plan, {"LLM_API_KEY": "sk-fixture-private"}, stop) == 0
     assert completed == (3 if stop_after_first else 6)
     assert [cfg.LEAK_DETECTOR_CONCURRENCY for cfg in configs] == ([10] if stop_after_first else [10, 15])
-    assert [cfg.LLM_MAX_CONCURRENCY for cfg in configs] == ([1] * len(configs) if costly else [8, 10][:len(configs)])
+    assert [cfg.LLM_MAX_CONCURRENCY for cfg in configs] == ([2, 3] if costly else [8, 10])[:len(configs)]
     expected_contract = db.collection_contract(runtime)
     assert all(db.collection_contract(db.snapshot_settings(cfg)) == expected_contract for cfg in configs)
     assert plan["status"] == ("stopped_at_batch_boundary" if stop_after_first else "complete")
@@ -551,7 +554,9 @@ async def test_dispatch_tuning_is_applied_between_batches_and_stop_drains(tmp_pa
 
 
 @pytest.mark.parametrize("control", [{"LLM_MAX_TOKENS": 100}, {"LEAK_DETECTOR_CONCURRENCY": 0},
-    {"LLM_MAX_CONCURRENCY": True}, {"LLM_MAX_CONCURRENCY": 21}, []])
+    {"LLM_MAX_CONCURRENCY": True}, {"LLM_MAX_CONCURRENCY": 21},
+    {"COLLECTION_BATCH_SAMPLES": 2}, {"COLLECTION_BATCH_SAMPLES": 301},
+    {"COLLECTION_BATCH_SAMPLES": True}, []])
 def test_dispatch_tuning_rejects_contract_fields_and_invalid_limits(tmp_path, monkeypatch, control):
     monkeypatch.setattr(collect_forecast_panel, "COLLECTION", tmp_path)
     monkeypatch.setattr(collect_forecast_panel, "local", lambda path: path)
@@ -578,6 +583,117 @@ async def test_delegated_profiles_leave_local_queue_without_becoming_complete(tm
     (tmp_path / "local_queue_exclusions.json").write_text(json.dumps({"run_id": "fixture", "profiles": ["unknown"]}))
     with pytest.raises(CollectionBlockedError, match="unknown profile"):
         collect_forecast_panel.excluded_profiles(plan)
+
+
+def test_dispatch_engineering_settings_preserve_inference_hash():
+    default = settings()
+    tuned = settings(COLLECTION_DRAIN_ON_ERROR=True, COLLECTION_EXPENSIVE_CONCURRENCY=2,
+                     LLM_MAX_CONCURRENCY=12, LEAK_DETECTOR_CONCURRENCY=20, COLLECTION_BATCH_SAMPLES=120)
+    assert default.COLLECTION_EXPENSIVE_CONCURRENCY == 1
+    assert db.compute_collection_contract_hash(db.snapshot_settings(default)) == db.compute_collection_contract_hash(db.snapshot_settings(tuned))
+    assert db.snapshot_settings(tuned)["COLLECTION_DRAIN_ON_ERROR"] is True
+
+
+@pytest.mark.parametrize("costly,done,quota_left,expected", [(False, 0, 1000, 3),
+    (False, 3, 1000, 120), (False, 3, 160, 15), (False, 597, 1000, 3), (True, 3, 1000, 15)])
+async def test_batch_size_preserves_pilot_quota_scope_and_expensive_limits(tmp_path, monkeypatch, costly, done, quota_left, expected):
+    runtime = settings(SAMPLING_N=3, MODEL_QUESTION_IDS={"test-arm": [f"q{i}" for i in range(200)]},
+        MODEL_PROFILES={"test-arm": {"model": "gpt-5.4" if costly else "glm-5"}}).model_dump()
+    runtime.pop("LEAK_DETECTOR_API_KEY")
+    monkeypatch.setattr(collect_forecast_panel, "ROOT", tmp_path)
+    monkeypatch.setattr(collect_forecast_panel, "COLLECTION", tmp_path)
+    monkeypatch.setattr(collect_forecast_panel, "local", lambda path: path)
+    (tmp_path / "runs/fixture").mkdir(parents=True)
+    (tmp_path / "dispatch_control.json").write_text(json.dumps({"COLLECTION_BATCH_SAMPLES": 120, "LLM_MAX_CONCURRENCY": 16}))
+    plan = {"phase": "continuation", "run_id": "fixture", "runtime": runtime}
+    stop = asyncio.Event()
+    async def quota(*args):
+        return quota_left
+    async def evaluate(config, *args, **kwargs):
+        nonlocal done
+        assert config.COLLECTION_SAMPLE_LIMIT == expected and config.SAMPLING_N == 3
+        assert config.LLM_MAX_CONCURRENCY == (1 if costly else 16)
+        assert db.collection_contract(db.snapshot_settings(config)) == db.collection_contract(runtime)
+        assert kwargs["skip_analysis"] is True
+        done += expected
+        stop.set()
+        return 0
+    monkeypatch.setattr(collect_forecast_panel, "available_searches", quota)
+    monkeypatch.setattr(collect_forecast_panel.evaluation, "_run_async", evaluate)
+    monkeypatch.setattr(collect_forecast_panel, "status", lambda _: {"profiles": {"test-arm": {"completed": done, "refusals": 0}}, "refusals": 0})
+    monkeypatch.setattr(collect_forecast_panel.shutil, "disk_usage", lambda _: SimpleNamespace(free=20 * 1024**3))
+    assert await collect_forecast_panel.dispatch_batches(plan, {"LLM_API_KEY": "sk-fixture"}, stop) == 0
+    assert plan["status"] == "stopped_at_batch_boundary"
+
+
+@pytest.mark.parametrize("failure", ["row", "auth", "retrieval"])
+async def test_collection_failure_drains_started_samples_without_admitting_pending(tmp_path, monkeypatch, failure):
+    config = settings(SAMPLING_N=3, LLM_MAX_CONCURRENCY=2, COLLECTION_DRAIN_ON_ERROR=True,
+                      REQUIRE_HEALTHY_RETRIEVAL=True, DB_COMMIT_BATCH=1)
+    conn = db.connect(tmp_path / "drain.db")
+    db.init_schema(conn, 3)
+    questions = [replace(_yes_no_question(), id=qid) for qid in ("q1", "q2")]
+    for q in questions:
+        conn.execute("INSERT INTO questions (id, choice_type, question_type, event, options, answer, end_time, imported_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     (q.id, q.choice_type, q.question_type, q.event, q.options, q.answer, q.end_time, db.utcnow_iso()))
+    both_started = asyncio.Event()
+    failure_returned = asyncio.Event()
+    finish_started = asyncio.Event()
+    release_writer = asyncio.Event()
+    started, cancelled = [], []
+    original_enqueue = runner.AsyncWriter.enqueue_result
+    async def delayed_error_write(writer, row):
+        if row.get("error"):
+            await release_writer.wait()
+        await original_enqueue(writer, row)
+    monkeypatch.setattr(runner.AsyncWriter, "enqueue_result", delayed_error_write)
+    async def execute(task, **kwargs):
+        started.append((task.question.id, task.sample_idx))
+        request = db.audit_event("llm.request", {"body": {"model": "fixture"}})
+        if len(started) == 2:
+            both_started.set()
+        await both_started.wait()
+        if task.question.id == "q1" and task.sample_idx == 0:
+            db.audit_event("llm.error", {"type": failure}, request_id=request)
+            failure_returned.set()
+            if failure == "auth":
+                raise runner.AuthError("fixture auth failure")
+            if failure == "retrieval":
+                raise CollectionBlockedError("fixture retrieval failure")
+            return runner._error_row(task.question, task.sample_idx, "network")
+        try:
+            await finish_started.wait()
+        except asyncio.CancelledError:
+            cancelled.append(task.sample_idx)
+            db.audit_event("llm.cancelled", {}, request_id=request)
+            raise
+        db.audit_event("llm.response", {"status": 200}, request_id=request)
+        return {**runner._error_row(task.question, task.sample_idx, "fixture"), "error": None}
+    monkeypatch.setattr(runner, "_run_task_with_retry", execute)
+    running = asyncio.create_task(runner.run(settings=config, filters=QFilter(), questions=questions,
+        templates={}, run_id="r", conns={"test-arm": conn}))
+    await asyncio.wait_for(failure_returned.wait(), 2)
+    finish_started.set()
+    await asyncio.sleep(0.02)
+    assert started == [("q1", 0), ("q1", 1)]
+    assert not cancelled
+    release_writer.set()
+    stats = await asyncio.wait_for(running, 2)
+    assert stats.aborted and stats.abort_reason
+    assert stats.planned == 2 and stats.deferred == 4
+    assert db.load_completed_samples(conn, 3) == {("q1", 1)}
+    assert conn.execute("SELECT count(*) FROM request_events WHERE kind='llm.cancelled'").fetchone()[0] == 0
+    resumed = []
+    async def complete(task, **kwargs):
+        resumed.append((task.question.id, task.sample_idx))
+        return {**runner._error_row(task.question, task.sample_idx, "fixture"), "error": None}
+    monkeypatch.setattr(runner, "_run_task_with_retry", complete)
+    stats = await runner.run(settings=config, filters=QFilter(), questions=questions, templates={},
+                             run_id="r", conns={"test-arm": conn})
+    assert not stats.aborted and stats.planned == 5 and stats.deferred == 0
+    assert ("q1", 1) not in resumed and len(resumed) == 5
+    assert len(db.load_completed_samples(conn, 3)) == 6
+    conn.close()
 
 
 async def test_quota_refresh_retries_only_the_failed_key_and_uses_start_time(monkeypatch):

@@ -437,6 +437,7 @@ async def run(
 
     done_counter = stats.completed_preexisting + stats.skipped_cutoff
     aborted = False
+    admission_closed = asyncio.Event()
 
     async def _worker(task: Task) -> None:
         nonlocal done_counter
@@ -449,13 +450,16 @@ async def run(
                 llm_semaphore=llm_sem, search_semaphore=search_sem,
             )
             dbmod.audit_event("sample.result", row)
+        kind = row.get("error")
+        retained_refusal = settings.COLLECTION_RETAIN_MODEL_REFUSALS and kind == ErrorKind.CONTENT_POLICY
+        blocks_collection = bool(kind and settings.REQUIRE_HEALTHY_RETRIEVAL and not retained_refusal)
+        if blocks_collection and settings.COLLECTION_DRAIN_ON_ERROR:
+            admission_closed.set()
         await writers[task.model].enqueue_result(row)
         done_counter += 1
-        kind = row.get("error")
         if kind:
             stats.errors[kind] = stats.errors.get(kind, 0) + 1
-            retained_refusal = settings.COLLECTION_RETAIN_MODEL_REFUSALS and kind == ErrorKind.CONTENT_POLICY
-            if settings.REQUIRE_HEALTHY_RETRIEVAL and not retained_refusal:
+            if blocks_collection:
                 raise CollectionBlockedError(f"sample failed: {kind}; inspect saved request events before resuming")
         _log_progress(
             run_id=run_id,
@@ -466,10 +470,32 @@ async def run(
             row=row,
         )
 
+    pending = iter(todo)
+    started = 0
+
+    async def _draining_worker() -> None:
+        nonlocal started, aborted
+        while not admission_closed.is_set():
+            task = next(pending, None)
+            if task is None:
+                return
+            started += 1
+            try:
+                await _worker(task)
+            except (AuthError, CollectionBlockedError) as exc:
+                admission_closed.set()
+                aborted = True
+                stats.abort_reason = stats.abort_reason or str(exc)
+                logger.error("[run={}] admission stopped; finishing started samples: {}", run_id, exc)
+                return
+
     worker_tasks: list[asyncio.Task] = []
     try:
-        for t in todo:
-            worker_tasks.append(asyncio.create_task(_worker(t)))
+        if settings.COLLECTION_DRAIN_ON_ERROR:
+            worker_tasks = [asyncio.create_task(_draining_worker())
+                            for _ in range(min(len(todo), settings.LLM_MAX_CONCURRENCY))]
+        else:
+            worker_tasks = [asyncio.create_task(_worker(task)) for task in todo]
         for fut in asyncio.as_completed(worker_tasks):
             try:
                 await fut
@@ -485,6 +511,9 @@ async def run(
             if not task.done():
                 task.cancel()
         await asyncio.gather(*worker_tasks, return_exceptions=True)
+        if settings.COLLECTION_DRAIN_ON_ERROR:
+            stats.deferred += len(todo) - started
+            stats.planned = started
         for w in writers.values():
             await w.drain()
         for w in writers.values():

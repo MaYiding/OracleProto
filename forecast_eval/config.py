@@ -490,6 +490,12 @@ class Settings(BaseSettings):
     """Maximum new samples per dispatch, with zero meaning unlimited."""
     COLLECTION_RETAIN_MODEL_REFUSALS: bool = False
     """Keep forecast-provider content refusals as terminal observations, without retrying their slots."""
+    COLLECTION_DRAIN_ON_ERROR: bool = False
+    """Stop admitting samples after a fatal error while finishing samples already started."""
+    COLLECTION_EXPENSIVE_CONCURRENCY: int = Field(default=1, ge=1, le=20)
+    """Sample concurrency for expensive profiles in the collection dispatcher."""
+    COLLECTION_BATCH_SAMPLES: int = Field(default=60, ge=3, le=300)
+    """Maximum samples in a normal collection batch after the three-sample pilot."""
     COLLECTION_REFERENCE_DBS: dict[str, list[str]] = Field(default_factory=dict)
     """Read-only prior collection strata whose completed slots must not be repeated."""
 

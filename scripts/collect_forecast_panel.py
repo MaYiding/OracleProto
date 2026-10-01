@@ -136,7 +136,7 @@ def prepare_batches(plan: dict) -> dict:
              "", "统一预算：每题 3 次；6 轮；4 次搜索；每次 5 条；输出上限 12,000 tokens；时间偏移 -1 天。",
              "默认模式沿用原模型 ID、采样参数及省略 effort 的方式，不把未指定的供应商默认设置标注为关闭思考。",
              "过滤模型：Qwen3.8-Flash，none，2048 tokens。原 80 题与新增题的过滤模型分层记录。",
-             "", "每个配置先采最多 3 次。便宜配置随后每小批最多 60 次采样、并发 5；昂贵配置每小批最多 15 次采样、并发 1。断点续跑按未完成采样槽计数。",
+             "", "每个配置先采最多 3 次，昂贵配置每小批最多 15 次采样。普通批次大小与预测、过滤、搜索、昂贵配置并发由运行设置及 dispatch_control.json 决定，在批次边界生效；每批实际值保存在运行目录的 dispatches.jsonl。断点续跑按未完成采样槽计数。",
              "每批开始查询 Tavily 余量，预留 100 次；不足以支撑完整小批时缩小批次或暂停。LLM 余额管理接口需要独立 Manage Key，当前没有该凭证，不能声称已检查模型账户余额；预测供应商内容拒绝单独留存，其他终止性错误即停。",
              "已完成样本不重跑。中断样本的每次请求保留独立 attempt_id，恢复时仅重试未完成样本。",
              "", "| 批次 | 运行 ID | 新增样本 | 搜索次数上限 |", "|---|---|---:|---:|"]
@@ -372,11 +372,14 @@ async def query_search_quota(keys: list[str]) -> int:
 def dispatch_settings(plan: dict, env: dict) -> Settings:
     path = local(COLLECTION / "dispatch_control.json")
     overrides = json.loads(path.read_text()) if path.exists() else {}
-    allowed = {"LLM_MAX_CONCURRENCY", "SEARCH_MAX_CONCURRENCY", "LEAK_DETECTOR_CONCURRENCY"}
-    if not isinstance(overrides, dict) or set(overrides) - allowed:
-        raise CollectionBlockedError("dispatch_control.json accepts only the three concurrency settings")
-    if any(type(value) is not int or not 1 <= value <= 20 for value in overrides.values()):
-        raise CollectionBlockedError("dispatch concurrency must be an integer from 1 through 20")
+    bounds = {name: (1, 20) for name in ("LLM_MAX_CONCURRENCY", "SEARCH_MAX_CONCURRENCY",
+                                       "LEAK_DETECTOR_CONCURRENCY", "COLLECTION_EXPENSIVE_CONCURRENCY")}
+    bounds["COLLECTION_BATCH_SAMPLES"] = (3, 300)
+    if not isinstance(overrides, dict) or set(overrides) - bounds.keys():
+        raise CollectionBlockedError("dispatch_control.json accepts only concurrency and batch settings")
+    if any(type(value) is not int or not bounds[name][0] <= value <= bounds[name][1]
+           for name, value in overrides.items()):
+        raise CollectionBlockedError("dispatch concurrency or batch setting is outside its integer bounds")
     return Settings(**{**plan["runtime"], **overrides}, LEAK_DETECTOR_API_KEY=env["LLM_API_KEY"])
 
 
@@ -432,12 +435,12 @@ async def dispatch_batches(plan: dict, env: dict, stop_requested: asyncio.Event 
             if stop_requested is not None and stop_requested.is_set():
                 continue
             costly = expensive(plan["runtime"]["MODEL_PROFILES"][name]["model"])
-            cap = 3 if done == 0 else (15 if costly else 60)
+            cap = 3 if done == 0 else (15 if costly else settings.COLLECTION_BATCH_SAMPLES)
             cap = min(cap, target - done, max(0, (remaining - 100) // 12 * 3))
             if cap < min(3, target - done):
                 raise CollectionBlockedError(f"Tavily reserve reached: {remaining} estimated credits remain")
             settings = settings.model_copy(update={"COLLECTION_MODEL": name, "COLLECTION_SAMPLE_LIMIT": cap,
-                                                   "LLM_MAX_CONCURRENCY": 1 if costly else settings.LLM_MAX_CONCURRENCY})
+                                                   "LLM_MAX_CONCURRENCY": settings.COLLECTION_EXPENSIVE_CONCURRENCY if costly else settings.LLM_MAX_CONCURRENCY})
             plan.update(status="running", active_profile=name, batch_sample_limit=cap,
                         tavily_remaining=remaining, updated_at=db.utcnow_iso())
             plan.pop("block_reason", None)

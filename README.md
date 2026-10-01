@@ -214,7 +214,13 @@ Set `SCORE_ANSWERS=false` and invoke `python evaluation.py --skip-analysis` to c
 
 To tune collection throughput, atomically replace `runs/collection_300/dispatch_control.json` with concurrency overrides, for example `{"LEAK_DETECTOR_CONCURRENCY": 10}`. The collector reads them before the next batch. `SIGTERM` requests a stop after the current batch finishes; the same run command resumes pending slots. Effective settings are retained in the run directory's `dispatches.jsonl`.
 
+`COLLECTION_EXPENSIVE_CONCURRENCY` sets the separate sample limit for expensive profiles and accepts the same batch-boundary overrides. With `COLLECTION_DRAIN_ON_ERROR=true`, a terminal failure stops admission of pending samples while samples already started finish and retain their evidence. The failed slot remains unresolved, and the collector stops after those samples drain.
+
 Delegated profiles can be excluded from the local queue with `runs/collection_300/local_queue_exclusions.json`, specifying `run_id` and `profiles`. The exclusion is checked before every batch; the run directory's `local_queue_state.json` records the startup queue and PID. Remaining delegated work keeps the phase status `local_queue_complete_pending_delegation`.
+
+`COLLECTION_BATCH_SAMPLES` controls normal batches after the three-sample pilot, with a default of 60. Increasing it reduces waits for the last slow sample between batches; concurrent samples remain bounded separately. Expensive profiles retain 15-sample batches, and every batch remains limited by remaining slots and the search-quota reserve. The control file can override this setting at a batch boundary.
+
+After receiving delegated runs, verify the sender’s checksums and confirm collection has stopped before setting each entry in `delegated_results.json` to `verified_return` with its project-relative `returned_artifacts` SHA-256 map. The catalog validates the fixed assignment, execution snapshots, raw journal, and inference contract before indexing those runs as independent sources. Unverified returns remain pending.
 
 `COLLECTION_RETAIN_MODEL_REFUSALS=true` preserves forecast-provider content refusals and continues other slots. It requires request auditing and skips retained refusals on resume. The catalog reports them separately from predictions; other terminal errors still stop strict collection.
 

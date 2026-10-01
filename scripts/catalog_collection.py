@@ -15,7 +15,127 @@ sys.path.insert(0, str(ROOT))
 from loguru import logger
 
 from forecast_eval import db
+from forecast_eval.config import ModelProfile
 from scripts.prepare_collection import FIELDS, digest, local, read_db
+
+
+def delegated_candidates(collection: Path, inventory: dict) -> tuple[list[dict], list[dict]]:
+    path = local(collection / "delegated_results.json")
+    if not path.exists():
+        return [], []
+    registry = json.loads(path.read_text())
+    candidates, states = [], []
+    for item in registry["profiles"]:
+        state = {key: item[key] for key in ("profile_id", "run_id", "expected_samples", "status")}
+        states.append(state)
+        if item["status"] != "verified_return":
+            continue
+        job_path = local(ROOT / item["job_path"])
+        if digest(job_path) != item["job_sha256"]:
+            raise ValueError("delegated job checksum mismatch")
+        job = json.loads(job_path.read_text())
+        package_manifest = local(job_path.parent.parent / "manifest.json")
+        if digest(package_manifest) != registry["handoff_manifest_sha256"]:
+            raise ValueError("frozen handoff manifest checksum mismatch")
+        frozen = json.loads(package_manifest.read_text())
+        runtime, profile = job["runtime"], item["profile_id"]
+        if (job["run_id"] != item["run_id"] or runtime["MODELS"] != [profile]
+                or runtime["MODEL_QUESTION_IDS"] != {profile: inventory["additional_ids"]}
+                or runtime["SAMPLING_N"] != 3 or runtime["SCORE_ANSWERS"]
+                or job["source_sha256"] != inventory["source_sha256"]
+                or item["source_sha256"] != inventory["source_sha256"]
+                or item["expected_samples"] != len(inventory["additional_ids"]) * 3):
+            raise ValueError("delegated assignment identity or scope mismatch")
+        run_dir = local(ROOT / "runs" / item["run_id"])
+        slug = db.compose_virtual_slug(profile, 5, 4)
+        result_path = local(run_dir / "db" / (db.model_slug_safe(slug) + ".db"))
+        if local(ROOT / item["expected_result_db"]) != result_path:
+            raise ValueError("delegated result path mismatch")
+        artifacts = item.get("returned_artifacts", {})
+        required = [result_path] + [run_dir / name for name in (
+            "manifest.json", "handoff_assignment.json", "executions.jsonl", "dispatches.jsonl")]
+        required += [sidecar for suffix in ("-wal", "-shm")
+                     if (sidecar := local(Path(str(result_path) + suffix))).exists()]
+        if any(str(local(p).relative_to(ROOT)) not in artifacts for p in required):
+            raise ValueError("delegated return lacks required artifact checksums")
+        for relative, expected in artifacts.items():
+            artifact = local(ROOT / relative)
+            if not artifact.is_relative_to(run_dir) or digest(artifact) != expected:
+                raise ValueError("delegated artifact checksum mismatch: " + relative)
+        assignment = json.loads(local(run_dir / "handoff_assignment.json").read_text())
+        if assignment["manifest_sha256"] != registry["handoff_manifest_sha256"]:
+            raise ValueError("delegated handoff identity mismatch")
+        if assignment["launcher_sha256"] != frozen["code_files"]["scripts/run_handoff.py"]:
+            raise ValueError("delegated launcher checksum mismatch")
+        assigned = assignment["plan"]
+        endpoint_fields = {"LLM_BASE_URL", "LEAK_DETECTOR_BASE_URL"}
+        if ({k: v for k, v in assigned.items() if k != "runtime"}
+                != {k: v for k, v in job.items() if k != "runtime"}
+                or {k: v for k, v in assigned["runtime"].items() if k not in endpoint_fields}
+                != {k: v for k, v in runtime.items() if k not in endpoint_fields}):
+            raise ValueError("delegated runtime differs from frozen assignment")
+        executions = [json.loads(line) for line in local(run_dir / "executions.jsonl").read_text().splitlines()]
+        if not executions or not local(run_dir / "dispatches.jsonl").read_text().strip():
+            raise ValueError("delegated execution or dispatch evidence is empty")
+        for execution in executions:
+            directory = local(ROOT / execution["directory"])
+            fingerprint = hashlib.sha256(json.dumps(execution["file_hashes"], sort_keys=True).encode()).hexdigest()
+            if not directory.is_relative_to(run_dir / "code") or fingerprint != execution["code_sha256"]:
+                raise ValueError("delegated code snapshot identity mismatch")
+            required_code = {name: value for name, value in frozen["code_files"].items()
+                             if name not in ("scripts/run_handoff.py", "scripts/prepare_handoff.py")}
+            if any(execution["file_hashes"].get(name) != value for name, value in required_code.items()):
+                raise ValueError("delegated execution differs from frozen code")
+            for name, expected in execution["file_hashes"].items():
+                code = local(directory / name)
+                if not code.is_relative_to(directory) or artifacts.get(str(code.relative_to(ROOT))) != expected:
+                    raise ValueError("delegated code snapshot checksum missing or mismatched")
+        manifest = json.loads(local(run_dir / "manifest.json").read_text())
+        if (manifest["run_id"] != item["run_id"] or manifest["sampling_n"] != 3
+                or manifest["models"] != [slug]
+                or manifest["hashes"]["source_db"] != inventory["source_sha256"]):
+            raise ValueError("delegated run manifest identity mismatch")
+        candidates.append({"path": str(result_path.relative_to(ROOT)), "expected_sha256": artifacts[str(result_path.relative_to(ROOT))],
+                           "profile_id": profile, "cohort": "continuation", "delegated_run_id": item["run_id"],
+                           "allowed_question_ids": inventory["additional_ids"], "assignment_runtime": assigned["runtime"],
+                           "expected_prompt_templates_hash": registry["expected_prompt_templates_hash"],
+                           "expected_detector_prompt_hash": registry["expected_detector_prompt_hash"],
+                           "return_artifacts": artifacts})
+    return candidates, states
+
+
+def validate_delegated_metadata(source: dict, inventory: dict) -> None:
+    if "delegated_run_id" not in source:
+        return
+    metadata = source["metadata"]
+    snapshot = json.loads(metadata["config_snapshot"])
+    runtime = source.pop("assignment_runtime")
+    expected = db.collection_contract(runtime)
+    expected["MODEL_PROFILES"] = {name: ModelProfile.model_validate(profile).model_dump(mode="json")
+                                  for name, profile in runtime["MODEL_PROFILES"].items()}
+    expected.update(TAVILY_MAX_RESULTS=5, REACT_MAX_SEARCH_CALLS=4,
+                    leak_detector_prompt_hash=source["expected_detector_prompt_hash"])
+    if (metadata["run_id"] != source["delegated_run_id"]
+            or metadata["model"] != db.compose_virtual_slug(source["profile_id"], 5, 4)
+            or metadata["sampling_n"] != 3 or metadata["source_db_hash"] != inventory["source_sha256"]
+            or metadata["prompt_templates_hash"] != source["expected_prompt_templates_hash"]
+            or db.compute_prompt_templates_hash(source["templates"]) != source["expected_prompt_templates_hash"]
+            or db.collection_contract(snapshot) != expected):
+        raise ValueError("delegated database inference or source contract mismatch")
+
+
+def validate_delegated_journal(conn: sqlite3.Connection, source: dict) -> None:
+    if "delegated_run_id" not in source:
+        return
+    exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='request_events'").fetchone()
+    if not exists:
+        raise ValueError("delegated result is missing its request journal")
+    allowed = set(source["allowed_question_ids"])
+    for run_id, model, question_id, sample_idx in conn.execute(
+            "SELECT DISTINCT run_id, model, question_id, sample_idx FROM request_events"):
+        if (run_id != source["delegated_run_id"] or model != source["metadata"]["model"]
+                or question_id not in allowed or sample_idx not in range(3)):
+            raise ValueError("delegated request journal contains an unassigned sample")
 
 
 def sample_coverage(plan: dict, question_ids: set[str], successes: dict, failures: dict) -> dict:
@@ -60,7 +180,16 @@ def observed_samples(conn: sqlite3.Connection, source: dict, questions: dict):
             prefix = f"s{sample_idx}_"
             if not row[prefix + "created_at"]:
                 continue
+            if "allowed_question_ids" in source and row["question_id"] not in source["allowed_question_ids"]:
+                raise ValueError("delegated result contains a question outside its assignment")
             result = {key[len(prefix):]: row[key] for key in row.keys() if key.startswith(prefix)}
+            if "delegated_run_id" in source:
+                kinds = {record[0] for record in conn.execute(
+                    "SELECT DISTINCT kind FROM request_events WHERE run_id=? AND model=? AND question_id=? AND sample_idx=? AND kind IN ('sample.result','llm.request')",
+                    (source["delegated_run_id"], source["metadata"]["model"], row["question_id"], sample_idx))}
+                required = {"sample.result"} if result["error"] == "skipped_training_cutoff" else {"sample.result", "llm.request"}
+                if not required <= kinds:
+                    raise ValueError("delegated observation lacks its forecast/result journal")
             if source["cohort"] != "reference" and result["error"] is None:
                 if result["correct"] is not None:
                     raise ValueError("collection unexpectedly contains scored answers")
@@ -130,6 +259,8 @@ def build_catalog() -> dict:
                     relative = str(path.relative_to(ROOT))
                     candidates.append({"path": relative, "profile_id": name, "cohort": phase,
                                        "expected_sha256": plan.get("reference_db_hashes", {}).get(relative)})
+    delegated, delegation = delegated_candidates(collection, inventory)
+    candidates.extend(delegated)
     sources = []
     seen = {}
     failures = {}
@@ -148,6 +279,8 @@ def build_catalog() -> dict:
                 source["metadata"] = dict(conn.execute("SELECT * FROM run_meta").fetchone())
                 source["collection_contract_hash"] = db.compute_collection_contract_hash(json.loads(source["metadata"]["config_snapshot"]))
                 source["templates"] = dict(conn.execute("SELECT key,value FROM prompt_templates"))
+                validate_delegated_metadata(source, inventory)
+                validate_delegated_journal(conn, source)
                 has_journal = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='request_events'").fetchone()
                 source["journal"] = {"table": "request_events", "event_id_through": conn.execute("SELECT coalesce(max(event_id),0) FROM request_events").fetchone()[0]} if has_journal else None
                 source["evidence_gaps"] = ["unfiltered search bodies", "dropped item text", "detector reasons", "raw HTTP attempts"] if source["cohort"] == "reference" else []
@@ -171,7 +304,7 @@ def build_catalog() -> dict:
     catalog = {"collection_id": "collection_300", "built_at": db.utcnow_iso(),
                "source_db": inventory["source_db"], "source_sha256": inventory["source_sha256"],
                "anchor_question_ids": inventory["anchor_ids"], "additional_question_ids": inventory["additional_ids"],
-                "phases": phases, "coverage": coverage,
+                "phases": phases, "coverage": coverage, "delegation": delegation,
                 "sources": sources, "observations_path": str(destination.relative_to(ROOT)),
                 "observations_encoding": "gzip",
                "observations_sha256": digest(destination),

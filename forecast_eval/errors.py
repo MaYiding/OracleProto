@@ -22,9 +22,8 @@ class ErrorKind(StrEnum):
 class AuthError(Exception):
     """Raised once by `llm.chat` when the API key is invalid / forbidden.
 
-    Runner catches this at the top level, cancels all in-flight tasks, flushes
-    the writer, and exits with a non-zero status. Content of the run_results
-    rows depends on runner policy.
+    Runner stops scheduling and exits with a non-zero status. Its collection
+    policy determines whether samples already started finish or are cancelled.
     """
 
 
