@@ -216,7 +216,7 @@ To tune collection throughput, atomically replace `runs/collection_300/dispatch_
 
 `COLLECTION_EXPENSIVE_CONCURRENCY` sets the separate sample limit for expensive profiles and accepts the same batch-boundary overrides. With `COLLECTION_DRAIN_ON_ERROR=true`, a terminal failure stops admission of pending samples while samples already started finish and retain their evidence. The failed slot remains unresolved, and the collector stops after those samples drain.
 
-Delegated profiles can be excluded from the local queue with `runs/collection_300/local_queue_exclusions.json`, specifying `run_id` and `profiles`. The exclusion is checked before every batch; the run directory's `local_queue_state.json` records the startup queue and PID. Remaining delegated work keeps the phase status `local_queue_complete_pending_delegation`.
+Deferred or delegated profiles can be excluded from the local queue with `runs/collection_300/local_queue_exclusions.json`, specifying `run_id` and `profiles`. A `local_queue_exclusions.json` in the run directory adds exclusions for that run without replacing another run's queue settings. Exclusions are checked before every batch; the run directory's `local_queue_state.json` records the startup queue and PID. Remaining excluded work keeps the phase status `local_queue_complete_pending_delegation`.
 
 `COLLECTION_BATCH_SAMPLES` controls normal batches after the three-sample pilot, with a default of 60. Increasing it reduces waits for the last slow sample between batches; concurrent samples remain bounded separately. Expensive profiles retain 15-sample batches, and every batch remains limited by remaining slots and the search-quota reserve. The control file can override this setting at a batch boundary.
 

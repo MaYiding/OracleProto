@@ -585,6 +585,31 @@ async def test_delegated_profiles_leave_local_queue_without_becoming_complete(tm
         collect_forecast_panel.excluded_profiles(plan)
 
 
+def test_run_local_exclusions_preserve_other_run_queue(tmp_path, monkeypatch):
+    monkeypatch.setattr(collect_forecast_panel, "ROOT", tmp_path)
+    monkeypatch.setattr(collect_forecast_panel, "COLLECTION", tmp_path)
+    monkeypatch.setattr(collect_forecast_panel, "local", lambda path: path)
+    shared = tmp_path / "local_queue_exclusions.json"
+    shared.write_text(json.dumps({"run_id": "first", "profiles": ["external"]}))
+    run_dir = tmp_path / "runs/second"
+    run_dir.mkdir(parents=True)
+    run_path = run_dir / "local_queue_exclusions.json"
+    run_path.write_text(json.dumps({"run_id": "second", "profiles": ["deferred"]}))
+    first = {"run_id": "first", "runtime": {"MODELS": ["external", "local"]}}
+    second = {"run_id": "second", "runtime": {"MODELS": ["glm", "kimi", "deferred"]}}
+    assert collect_forecast_panel.excluded_profiles(first) == {"external"}
+    assert collect_forecast_panel.excluded_profiles(second) == {"deferred"}
+    assert second["runtime"]["MODELS"] == ["glm", "kimi", "deferred"]
+    shared.write_text(json.dumps({"run_id": "second", "profiles": ["glm"]}))
+    assert collect_forecast_panel.excluded_profiles(second) == {"glm", "deferred"}
+    run_path.write_text(json.dumps({"run_id": "first", "profiles": ["deferred"]}))
+    with pytest.raises(CollectionBlockedError, match="mismatched run ID"):
+        collect_forecast_panel.excluded_profiles(second)
+    run_path.write_text(json.dumps({"run_id": "second", "profiles": ["unknown"]}))
+    with pytest.raises(CollectionBlockedError, match="unknown profile"):
+        collect_forecast_panel.excluded_profiles(second)
+
+
 def test_dispatch_engineering_settings_preserve_inference_hash():
     default = settings()
     tuned = settings(COLLECTION_DRAIN_ON_ERROR=True, COLLECTION_EXPENSIVE_CONCURRENCY=2,

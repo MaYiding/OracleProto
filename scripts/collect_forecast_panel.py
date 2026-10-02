@@ -393,18 +393,26 @@ def record_dispatch(plan: dict, event: str, **fields) -> None:
 
 
 def excluded_profiles(plan: dict) -> set[str]:
-    path = local(COLLECTION / "local_queue_exclusions.json")
-    if not path.exists():
-        return set()
-    value = json.loads(path.read_text())
-    if value.get("run_id") != plan.get("run_id"):
-        return set()
-    profiles = value.get("profiles")
-    if not isinstance(profiles, list) or any(not isinstance(name, str) for name in profiles):
-        raise CollectionBlockedError("local queue exclusions require profile IDs")
-    excluded = set(profiles)
-    if excluded - set(plan["runtime"]["MODELS"]):
-        raise CollectionBlockedError("local queue exclusions contain an unknown profile")
+    shared_path = local(COLLECTION / "local_queue_exclusions.json")
+    run_id = plan.get("run_id")
+    run_path = local(ROOT / "runs" / run_id / "local_queue_exclusions.json") if run_id else None
+    excluded = set()
+    for path in (shared_path, run_path):
+        if path is None or not path.exists():
+            continue
+        value = json.loads(path.read_text())
+        if not isinstance(value, dict):
+            raise CollectionBlockedError("local queue exclusions require an object")
+        if value.get("run_id") != run_id:
+            if path == run_path:
+                raise CollectionBlockedError("run-local queue exclusions have a mismatched run ID")
+            continue
+        profiles = value.get("profiles")
+        if not isinstance(profiles, list) or any(not isinstance(name, str) for name in profiles):
+            raise CollectionBlockedError("local queue exclusions require profile IDs")
+        if set(profiles) - set(plan["runtime"]["MODELS"]):
+            raise CollectionBlockedError("local queue exclusions contain an unknown profile")
+        excluded.update(profiles)
     return excluded
 
 

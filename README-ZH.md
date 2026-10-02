@@ -200,7 +200,7 @@ python -B -m forecast_eval.analysis runs/{run_id}
 
 `COLLECTION_EXPENSIVE_CONCURRENCY` 单独设置昂贵配置的采样并发，也支持在小批边界覆盖。`COLLECTION_DRAIN_ON_ERROR=true` 时，终止性失败会停止接收待执行样本，已开始的样本继续完成并留存证据。失败槽位保持未解决状态，采集器等这些样本收尾后停止。
 
-交给其他执行者的配置可通过 `runs/collection_300/local_queue_exclusions.json` 从本机队列排除，文件指定 `run_id` 和 `profiles`。每个小批前检查排除列表；运行目录的 `local_queue_state.json` 记录启动队列及 PID。仍有委派工作时，批次状态保持 `local_queue_complete_pending_delegation`。
+延后或交给其他执行者的配置可通过 `runs/collection_300/local_queue_exclusions.json` 从本机队列排除，文件指定 `run_id` 和 `profiles`。运行目录中的 `local_queue_exclusions.json` 可为该运行追加排除项，不替换另一个运行的队列设置。每个小批前检查排除列表；运行目录的 `local_queue_state.json` 记录启动队列及 PID。仍有排除的任务时，批次状态保持 `local_queue_complete_pending_delegation`。
 
 `COLLECTION_BATCH_SAMPLES` 控制 3 次采样试跑之后的普通批次大小，默认 60。增大它可以减少批次间等待最后一个慢样本的频率；同时在途的样本数仍受独立并发上限约束。昂贵配置保持每批 15 次，所有批次仍受剩余槽位和搜索额度预留限制。控制文件可在批次边界覆盖此设置。
 
