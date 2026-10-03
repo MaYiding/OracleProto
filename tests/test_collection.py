@@ -18,7 +18,7 @@ from forecast_eval.tavily_keys import TavilyKeyPool
 from tests.test_evaluation import _call_init_model_db
 from tests.test_leak_filter import _envelope, _scripted_client, _capturing_client
 from tests.test_llm_no_browsing import _success_body
-from tests.test_react import _ScriptedLLM, _yes_no_question
+from tests.test_react import _ScriptedLLM, _yes_no_question, _tool_msg, _final_msg
 from forecast_eval.types import QFilter
 from scripts.catalog_collection import sample_coverage
 from scripts import collect_forecast_panel
@@ -339,6 +339,64 @@ async def test_exhausted_search_pool_blocks_collection():
     async with httpx.AsyncClient() as client:
         with pytest.raises(CollectionBlockedError):
             await tavily_search("query", "2020-01-01", config, pool=pool, client=client)
+
+
+@pytest.mark.parametrize("invalid_count", [1, 4])
+@respx.mock
+async def test_invalid_query_preserves_audit_and_fixed_search_budget(tmp_path, monkeypatch, invalid_count):
+    config = settings(
+        SCORE_ANSWERS=False, REQUIRE_HEALTHY_RETRIEVAL=True, WRITE_REQUEST_AUDIT=True,
+        WRITE_MESSAGES_TRACE=True, REACT_REFLECTION_PROTOCOL=False, REACT_MAX_STEPS=6,
+        REACT_MAX_SEARCH_CALLS=[4], REACT_MIN_SEARCH_CALLS=0, REACT_MAX_NUDGES=0,
+        REACT_FORCE_FINAL_ANSWER_NEAR_LIMIT=False, SEARCH_BACKOFF_S=[0, 0, 0],
+    ).model_copy(update={"TAVILY_MAX_RESULTS": 5, "REACT_MAX_SEARCH_CALLS": 4})
+    rejection = {"detail": {"error": "Query cannot consist only of site: operators. Please provide search terms."}}
+    queries = ["site:androidcentral.com/phones/google-pixel-11"] * invalid_count
+    queries += [f"Google Pixel 11 launch evidence {i}" for i in range(4 - invalid_count)]
+    scripted = _ScriptedLLM([(_tool_msg(f"call_{i}", query), "tool_calls", {}) for i, query in enumerate(queries)]
+                            + [(_final_msg(), "stop", {})])
+    tools_seen = []
+
+    async def predict(**kwargs):
+        tools_seen.append(kwargs["tools"])
+        return await scripted(**kwargs)
+
+    def search_response(request):
+        query = json.loads(request.content)["query"]
+        return httpx.Response(400, json=rejection) if query.startswith("site:") else httpx.Response(200, json={"results": []})
+
+    route = respx.post("https://api.tavily.com/search").mock(side_effect=search_response)
+    monkeypatch.setattr(react, "llm_chat", predict)
+    monkeypatch.setattr(react, "parse_gt", lambda _: pytest.fail("collection must not score gold"))
+    conn = db.connect(tmp_path / "query.db")
+    db.init_schema(conn, 1)
+    with db.capture_requests(conn, settings=config, run_id="r", model="test-arm", question_id="q", sample_idx=0):
+        result = await react.run_react(_yes_no_question(), model="test-arm", sample_idx=0,
+                                      settings=config, templates=DEFAULT_PROMPT_TEMPLATES, run_id="r")
+    assert route.call_count == 4
+    calls = json.loads(result.search_calls)
+    assert len(calls) == 4 and [row["query"] for row in calls] == queries
+    assert sum(row.get("error_kind") == "invalid_query" for row in calls) == invalid_count
+    assert result.react_steps == 5 and result.correct is None
+    assert tools_seen[-1] == [] and all(tools_seen[:-1])
+    tool_payloads = [json.loads(row["content"]) for row in json.loads(result.messages_trace) if row["role"] == "tool"]
+    assert len(tool_payloads) == 4
+    assert all(row["error"] == "invalid_query" and row["message"] == rejection["detail"]["error"]
+               for row in tool_payloads[:invalid_count])
+    assert all(row == {"results": []} for row in tool_payloads[invalid_count:])
+    events = conn.execute("SELECT * FROM request_events ORDER BY event_id").fetchall()
+    assert [row["kind"] for row in events] == ["search.request", "search.response"] * 4
+    for i in range(4):
+        request, response = events[2 * i:2 * i + 2]
+        assert request["request_id"] == response["request_id"]
+        body = json.loads(request["payload"])["body"]
+        assert body["query"] == queries[i] and body["end_date"] == calls[i]["end_date"]
+        assert "api_key" not in body
+        raw = json.loads(response["payload"])
+        assert raw["status"] == (400 if i < invalid_count else 200)
+        if i < invalid_count:
+            assert json.loads(raw["body"]) == rejection
+    conn.close()
 
 
 def test_resume_rejects_reasoning_change_before_overwriting_metadata(tmp_path):

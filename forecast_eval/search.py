@@ -16,9 +16,12 @@ from .tavily_keys import AllKeysExhausted, TavilyKeyPool, get_pool
 TAVILY_ENDPOINT = "https://api.tavily.com/search"
 # Tavily uses 401 / 403 to signal an invalid key or permission issue (permanent
 # blacklist); 429 / quota-related responses also use 429 (temporary cooldown).
-# Other status codes fall into "other" (network / server errors).
+# Recognized query validation failures belong to the tool caller, not the key.
 _AUTH_STATUS = frozenset({401, 403})
 _RATE_LIMIT_STATUS = frozenset({429})
+_SITE_ONLY_QUERY_ERROR = (
+    "Query cannot consist only of site: operators. Please provide search terms."
+)
 
 
 @dataclass
@@ -189,6 +192,20 @@ async def _single_request(
     return response
 
 
+def _query_validation_error(response: httpx.Response) -> dict[str, Any] | None:
+    """Only an explicit query rejection is safe to return as a tool error."""
+    if response.status_code != 400:
+        return None
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, dict) and detail.get("error") == _SITE_ONLY_QUERY_ERROR:
+        return body
+    return None
+
+
 async def tavily_search(
     query: str,
     end_date: str,
@@ -206,13 +223,16 @@ async def tavily_search(
       retry**, immediately swap key and try again (no sleep).
     - 429 -> temporarily cool down that key, also immediately swap key and
       try again.
+    - Explicit HTTP 400 site-only query rejection -> return `invalid_query`
+      without retrying or penalizing the key; the ReAct search budget is consumed.
     - 5xx / network / bad-JSON -> consumes the `SEARCH_RETRY_MAX` network-retry
       quota, sleeps per `SEARCH_BACKOFF_S` then retries (key not blacklisted).
     - All keys unavailable (AllKeysExhausted) -> return the error immediately,
       no further rotation.
 
-    The return value is still a `SearchResult` (does not raise), so the ReAct
-    loop can feed tool_result back into the LLM.
+    Query validation errors return `SearchResult` for the ReAct tool cycle.
+    Unavailable retrieval raises `CollectionBlockedError` when strict collection
+    is enabled; otherwise it returns an error result.
     """
     owns_client = client is None
     if owns_client:
@@ -276,6 +296,16 @@ async def tavily_search(
                 network_class_error = True
             else:
                 status = resp.status_code
+                query_error = _query_validation_error(resp)
+                if query_error is not None:
+                    await pool.report_ok(api_key)
+                    return SearchResult(
+                        query=query,
+                        end_date=end_date,
+                        error_kind="invalid_query",
+                        error_message=_SITE_ONLY_QUERY_ERROR,
+                        raw_response=query_error,
+                    )
                 if status == 200:
                     try:
                         data = resp.json()
