@@ -17,6 +17,7 @@ from loguru import logger
 from forecast_eval import db
 from forecast_eval.config import ModelProfile
 from scripts.prepare_collection import FIELDS, digest, local, read_db
+from scripts import collection_billing as billing
 
 
 def delegated_candidates(collection: Path, inventory: dict) -> tuple[list[dict], list[dict]]:
@@ -300,11 +301,21 @@ def build_catalog() -> dict:
                 conn.close()
             sources.append(source)
     coverage = [sample_coverage(plan, set(questions), seen, failures) for plan in plans]
+    billing_scope = None
+    if any(plan['phase']=='billing_extension' for plan in plans):
+        schedule_path=local(collection/'billing_schedule.json')
+        schedule=json.loads(schedule_path.read_text())
+        extension=next(plan for plan in plans if plan['phase']=='billing_extension')
+        if schedule['run_id']!=extension['run_id']:
+            raise ValueError('Billing schedule and source run differ')
+        rows=next(row['profiles'] for row in coverage if row['phase']=='billing_extension')
+        billing_scope={**billing.scope_coverage(schedule,rows),'schedule_sha256':digest(schedule_path)}
     staging.replace(destination)
     catalog = {"collection_id": "collection_300", "built_at": db.utcnow_iso(),
                "source_db": inventory["source_db"], "source_sha256": inventory["source_sha256"],
                "anchor_question_ids": inventory["anchor_ids"], "additional_question_ids": inventory["additional_ids"],
                 "phases": phases, "coverage": coverage, "delegation": delegation,
+                "billing_scope": billing_scope,
                 "sources": sources, "observations_path": str(destination.relative_to(ROOT)),
                 "observations_encoding": "gzip",
                "observations_sha256": digest(destination),

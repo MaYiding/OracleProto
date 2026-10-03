@@ -62,6 +62,27 @@ def test_ready_jobs_preserve_tiers_and_fill_other_groups(ledger):
     assert [x['profile_id'] for x in ready_jobs(spec,ledger,'2026-10-04T00:00:00+08:00',counts)]==['high']
 
 
+def test_semantic_deduplication_and_holds_never_become_observations(ledger):
+    jobs=[dict(profile_id=n,billing_group=n,tier=0,not_before_billing_date='2026-10-03',expected_samples=3,
+               dispatch_status=s) for n,s in [('off','runnable'),('on','deduplicated'),('unknown','semantic_verification_required')]]
+    spec={'key_alias':'key','jobs':jobs}
+    counts={n:{'completed':0,'refusals':0} for n in ('off','on','unknown')}
+    assert [x['profile_id'] for x in ready_jobs(spec,ledger,'2026-10-03T08:00:00+08:00',counts)]==['off']
+    coverage={n:{'expected':3,'collected':0,'refused':0} for n in counts}
+    assert not billing.scope_coverage(spec,coverage)['attempts_complete']
+    coverage['off'].update(collected=2,refused=1)
+    result=billing.scope_coverage(spec,coverage)
+    assert result['attempts_complete'] and result['expected']==3 and result['collected']==2
+    assert [x['dispatch_status'] for x in result['uncollected_profiles']]==['deduplicated','semantic_verification_required']
+    assert coverage['on']['collected']==coverage['unknown']['collected']==0
+    counts['off'].update(completed=2,refusals=1)
+    assert ready_jobs(spec,ledger,'2026-10-04T08:00:00+08:00',counts)==[]
+    coverage['off']['expected']=4
+    with pytest.raises(ValueError,match='target differ'):billing.scope_coverage(spec,coverage)
+    jobs[0]['dispatch_status']='typo'
+    with pytest.raises(ValueError,match='Unknown billing'):billing.runnable_jobs(spec)
+
+
 def test_journal_incremental_sync_retains_midnight_outcomes(ledger,tmp_path):
     import sqlite3
     path=tmp_path/'raw.db';raw=sqlite3.connect(path)

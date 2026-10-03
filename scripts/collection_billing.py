@@ -14,6 +14,33 @@ ZONE = ZoneInfo("Asia/Shanghai")
 DIRECTORY = local(ROOT / "runs/collection_300/billing")
 
 
+def runnable_jobs(spec):
+    jobs = spec['jobs']
+    allowed = {'runnable', 'deduplicated', 'semantic_verification_required'}
+    if any(job.get('dispatch_status', 'runnable') not in allowed for job in jobs):
+        raise ValueError('Unknown billing dispatch status')
+    return [job for job in jobs if job.get('dispatch_status', 'runnable') == 'runnable']
+
+
+def scope_coverage(spec, profiles):
+    selected = runnable_jobs(spec)
+    expected = sum(job['expected_samples'] for job in selected)
+    collected = sum(profiles[job['profile_id']]['collected'] for job in selected)
+    refused = sum(profiles[job['profile_id']].get('refused', 0) for job in selected)
+    if any(profiles[job['profile_id']]['expected'] != job['expected_samples'] for job in spec['jobs']):
+        raise ValueError('Catalog and billing target differ')
+    return {'expected': expected, 'collected': collected, 'refused': refused,
+            'pending': expected-collected-refused,
+            'attempts_complete': expected == collected+refused,
+            'selected_profiles': [job['profile_id'] for job in selected],
+            'uncollected_profiles': [
+                {'profile_id': job['profile_id'], 'expected_samples': job['expected_samples'],
+                 'dispatch_status': job['dispatch_status'], 'reason': job.get('dispatch_reason'),
+                 'evidence': job.get('selection_evidence')}
+                for job in spec['jobs'] if job not in selected],
+            'conditional_profiles': spec.get('conditional_profiles', [])}
+
+
 def timestamp(value):
     dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if dt.tzinfo is None:

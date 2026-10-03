@@ -42,7 +42,7 @@ def key_alias(env): return 'aihubmix-'+hashlib.sha256(env['LLM_API_KEY'].encode(
 
 
 def ready_jobs(spec,ledger,at,counts):
-    pending=[job for job in spec['jobs'] if counts[job['profile_id']]['completed']+counts[job['profile_id']].get('refusals',0)<job['expected_samples']]
+    pending=[job for job in billing.runnable_jobs(spec) if counts[job['profile_id']]['completed']+counts[job['profile_id']].get('refusals',0)<job['expected_samples']]
     if not pending:return []
     tier=min(job['tier'] for job in pending)
     day=billing.timestamp(at).astimezone(billing.ZONE).date().isoformat()
@@ -56,6 +56,7 @@ def validate(spec,plan,env):
     if spec['billing_timezone']!='Asia/Shanghai' or spec['day_boundary']!='00:00':raise ValueError('Billing timezone is not confirmed')
     if digest(local(ROOT/plan['runtime']['SOURCE_DB']))!=plan['source_sha256']:raise ValueError('Source changed')
     if {job['profile_id'] for job in spec['jobs']}!=set(plan['runtime']['MODELS']):raise ValueError('Queue differs from authorized scope')
+    billing.runnable_jobs(spec)
     settings=dispatch_settings(plan,env)
     if db.compute_collection_contract_hash(db.snapshot_settings(settings))!=spec['inference_contract_hash']:raise ValueError('Inference contract changed')
     if not (settings.SAMPLING_N==3 and settings.REACT_MAX_STEPS==6 and settings.REACT_MAX_SEARCH_CALLS==[4]
@@ -68,6 +69,12 @@ def validate(spec,plan,env):
         probe=probes.get(name,{})
         if not probe.get('ok') or probe.get('profile')!=plan['runtime']['MODEL_PROFILES'][name]:raise ValueError('Unverified profile '+name)
         if job['billing_group']!=billing.billing_group(plan['runtime']['MODEL_PROFILES'][name]['model']):raise ValueError('Billing alias mapping changed')
+        if job.get('dispatch_status', 'runnable')!='runnable':
+            evidence=job['selection_evidence'];path=local(ROOT/evidence['path'])
+            if digest(path)!=evidence['sha256']:raise ValueError('Selection evidence changed')
+            decisions=read(path)['queue_decisions']
+            decision=next((item for item in decisions if item['profile_id']==name),None)
+            if not decision or decision['dispatch_status']!=job['dispatch_status']:raise ValueError('Unsupported selection decision')
     return settings
 
 
@@ -151,9 +158,12 @@ async def run(spec,plan,env,ledger):
                     validate(spec,plan,env)
                     billing.sync_all(ledger,spec['key_alias']); billing.export(ledger,spec['key_alias'])
                     counts=status(plan)['profiles']; ready=ready_jobs(spec,ledger,now(),counts)
-                    pending=sum(job['expected_samples']-counts[job['profile_id']]['completed']-counts[job['profile_id']].get('refusals',0) for job in spec['jobs'])
+                    pending=sum(job['expected_samples']-counts[job['profile_id']]['completed']-counts[job['profile_id']].get('refusals',0) for job in billing.runnable_jobs(spec))
                     if pending<0:raise ValueError('Observed slots exceed the authorized target')
-                    save(counts=counts,pending=pending)
+                    save(counts=counts,pending=pending,
+                         uncollected_profiles=[{'profile_id':job['profile_id'],'dispatch_status':job['dispatch_status'],
+                                                'expected_samples':job['expected_samples']} for job in spec['jobs']
+                                               if job.get('dispatch_status','runnable')!='runnable'])
                     if not pending:
                         save(status='collection_complete_pending_catalog');break
                     if not ready:
@@ -214,8 +224,10 @@ async def run(spec,plan,env,ledger):
             if code==0 and state['status']=='collection_complete_pending_catalog':
                 catalog=read(COLLECTION/'catalog.json')
                 coverage=next(row for row in catalog['coverage'] if row['phase']=='billing_extension')
-                if not coverage['attempts_complete']:raise ValueError('Catalog has unresolved target slots')
-                save(status='complete')
+                selected=billing.scope_coverage(spec,coverage['profiles'])
+                if not selected['attempts_complete']:raise ValueError('Catalog has unresolved selected slots')
+                if catalog.get('billing_scope',{}).get('schedule_sha256')!=digest(SPEC):raise ValueError('Catalog billing selection is stale')
+                save(status='complete',selected_coverage=selected)
     return 4 if state['status']=='blocked' else 0
 
 
