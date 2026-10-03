@@ -64,6 +64,7 @@ venv.bak/
 .cursor/
 .cursor-tutor/
 .codex/
+.learnings/
 .agents/
 .claude/
 .gemini/

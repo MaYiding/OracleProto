@@ -32,13 +32,16 @@ import asyncio
 import hashlib
 import json
 import time
+import weakref
+from dataclasses import asdict
 from typing import Any
 
 from loguru import logger
 from openai import AsyncOpenAI
 
 from .config import Settings
-from .errors import AuthError, ErrorKind, classify, should_retry
+from .db import audit_event
+from .errors import AuthError, CollectionBlockedError, ErrorKind, classify, should_retry
 from .search import SearchResult, SearchResultItem
 
 
@@ -107,6 +110,13 @@ def _compute_prompt_hash() -> str:
 # ---- Detector client (process-level singleton, independent of llm._client) ---
 
 _detector_client: AsyncOpenAI | None = None
+_detector_semaphores: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _detector_semaphore(limit: int) -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    semaphores = _detector_semaphores.setdefault(loop, {})
+    return semaphores.setdefault(limit, asyncio.Semaphore(limit))
 
 
 def get_detector_client(settings: Settings) -> AsyncOpenAI:
@@ -129,6 +139,7 @@ def get_detector_client(settings: Settings) -> AsyncOpenAI:
         _detector_client = AsyncOpenAI(
             api_key=settings.LEAK_DETECTOR_API_KEY,
             base_url=base_url,
+            max_retries=0,
         )
     return _detector_client
 
@@ -263,6 +274,12 @@ async def _detect_one(
         "temperature": settings.LEAK_DETECTOR_TEMPERATURE,
         "timeout": settings.LEAK_DETECTOR_TIMEOUT_S,
     }
+    effort = getattr(settings, "LEAK_DETECTOR_REASONING_EFFORT", None)
+    if effort is not None:
+        base_kwargs["extra_body"] = {"reasoning_effort": effort}
+    response_format = getattr(settings, "LEAK_DETECTOR_RESPONSE_FORMAT", None)
+    if response_format is not None:
+        base_kwargs["response_format"] = {"type": response_format}
     _assert_detector_safe(model, base_kwargs)
 
     backoff = list(settings.LEAK_DETECTOR_BACKOFF_S)
@@ -272,9 +289,20 @@ async def _detect_one(
     last_content: str | None = None
 
     for attempt in range(1, max_attempts + 1):
+        request_id = audit_event("detector.request", {
+            "endpoint": (settings.LEAK_DETECTOR_BASE_URL or settings.LLM_BASE_URL).rstrip("/") + "/chat/completions",
+            "body": {**{k: v for k, v in base_kwargs.items() if k not in ("timeout", "extra_body")},
+                     **base_kwargs.get("extra_body", {})}, "attempt": attempt,
+        })
         try:
             raw = await client.chat.completions.with_raw_response.create(**base_kwargs)
-        except BaseException as exc:  # noqa: BLE001 — classify and decide
+        except asyncio.CancelledError:
+            audit_event("detector.cancelled", {}, request_id=request_id)
+            raise
+        except Exception as exc:
+            audit_event("detector.error", {"type": type(exc).__name__, "message": str(exc),
+                        "status": getattr(exc, "status_code", None),
+                        "body": getattr(getattr(exc, "response", None), "text", None)}, request_id=request_id)
             kind = classify(exc)
             last_exc = exc
             last_kind = kind
@@ -296,6 +324,8 @@ async def _detect_one(
                 return _failure_reason(kind, exc), str(exc)[:200]
             # retryable: fall through to backoff
         else:
+            audit_event("detector.response", {"status": getattr(raw, "status_code", None),
+                        "body": getattr(raw, "text", None)}, request_id=request_id)
             try:
                 parsed = raw.parse()
                 content = parsed.choices[0].message.content if parsed.choices else None
@@ -306,6 +336,7 @@ async def _detect_one(
             last_content = content if isinstance(content, str) else None
             verdict_pair = _parse_verdict(last_content or "")
             if verdict_pair is not None:
+                audit_event("detector.verdict", {"verdict": verdict_pair[0], "reason": verdict_pair[1]}, request_id=request_id)
                 return verdict_pair
             # Treat parse failure as a logical failure: count it as a retry.
             last_kind = last_kind or ErrorKind.UNKNOWN
@@ -384,13 +415,15 @@ async def filter_search_result(
         "detector_latency_ms": 0,
         "detector_error_kind": None,
         "published_dates_raw": published_dates_raw,
+        "results_raw": [asdict(item) for item in items],
+        "detector_reasons": [],
     }
     if n_raw == 0:
         result.audit = audit_skeleton
         return result
 
     detector_client = client if client is not None else get_detector_client(settings)
-    semaphore = asyncio.Semaphore(max(1, int(settings.LEAK_DETECTOR_CONCURRENCY)))
+    semaphore = _detector_semaphore(max(1, int(settings.LEAK_DETECTOR_CONCURRENCY)))
 
     async def _bounded(idx: int, it: SearchResultItem) -> tuple[int, str, str]:
         async with semaphore:
@@ -408,12 +441,17 @@ async def filter_search_result(
     # invariant).
     pairs.sort(key=lambda p: p[0])
     verdicts = [v for _, v, _ in pairs]
+    content_policy_drops = {
+        verdict for verdict in verdicts
+        if getattr(settings, "LEAK_DETECTOR_DROP_CONTENT_POLICY", False)
+        and verdict.split(":", 2)[:2] == ["failed", "content_policy"]
+    }
     fail_action = settings.LEAK_DETECTOR_FAIL_ACTION
     kept: list[SearchResultItem] = []
     for it, verdict in zip(items, verdicts):
         if verdict == "keep":
             kept.append(it)
-        elif verdict == "drop":
+        elif verdict == "drop" or verdict in content_policy_drops:
             continue
         else:  # failed:*
             if fail_action == "keep":
@@ -422,6 +460,7 @@ async def filter_search_result(
 
     audit_skeleton["n_results_kept"] = len(kept)
     audit_skeleton["detector_verdicts"] = verdicts
+    audit_skeleton["detector_reasons"] = [reason for _, _, reason in pairs]
     audit_skeleton["detector_latency_ms"] = elapsed_ms
     audit_skeleton["detector_error_kind"] = _dominant_error_kind(verdicts)
 
@@ -433,4 +472,8 @@ async def filter_search_result(
         # search-tool spec).
         result.answer = None
     result.audit = audit_skeleton
+    audit_event("search.filtered", {"audit": audit_skeleton, "visible_payload": result.to_llm_payload()})
+    blocking_failures = [v for v in verdicts if v.startswith("failed:") and v not in content_policy_drops]
+    if blocking_failures and getattr(settings, "REQUIRE_HEALTHY_RETRIEVAL", False):
+        raise CollectionBlockedError("detector failed; collection paused with raw evidence preserved")
     return result
