@@ -241,7 +241,7 @@ def build_catalog() -> dict:
     phases = []
     plans = []
     repairs = []
-    for phase in ("continuation", "reasoning", "repair"):
+    for phase in ("continuation", "reasoning", "repair", "billing_extension"):
         path = local(collection / (phase + ".json"))
         if not path.exists():
             continue
