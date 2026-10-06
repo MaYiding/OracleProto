@@ -11,8 +11,10 @@ Contracts:
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import uuid
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Callable
@@ -22,7 +24,7 @@ from loguru import logger
 from . import db as dbmod
 from .config import Settings
 from .db import AsyncWriter, utcnow_iso
-from .errors import AuthError, ErrorKind, classify
+from .errors import AuthError, CollectionBlockedError, ErrorKind, classify
 from .llm import AuthError as _LLMAuthError  # noqa: F401 — re-exported for callers
 from .react import run_react
 from .types import QFilter, Question, SampleResult
@@ -48,6 +50,9 @@ class RunStats:
     planned: int = 0
     done: int = 0
     errors: dict[str, int] = field(default_factory=dict)
+    aborted: bool = False
+    abort_reason: str | None = None
+    deferred: int = 0
 
 
 def generate_run_id(now: datetime | None = None) -> str:
@@ -170,18 +175,25 @@ def build_task_plan(
         _real, R, C = parsed
         return settings_factory(slug, R, C)
 
-    for q in questions:
+    scoped_ids = {qid for ids in (getattr(settings, "MODEL_QUESTION_IDS", {}) or {}).values() for qid in ids}
+    for q in sorted(questions, key=lambda question: question.id not in scoped_ids):
         q_end = date.fromisoformat(q.end_time)
         for model in settings.MODELS:
             # `model` may be a virtual slug `{real}::r{R}::c{C}` — peel the real
             # part off for cutoff lookup; falls back to `model` when not virtual.
             parsed = dbmod.parse_virtual_slug(model)
             real_model = parsed[0] if parsed is not None else model
+            allowed = (getattr(settings, "MODEL_QUESTION_IDS", {}) or {}).get(real_model)
+            if allowed is not None and q.id not in allowed:
+                continue
             cutoff = settings.MODEL_TRAINING_CUTOFFS.get(real_model)
             is_cutoff_hit = cutoff is not None and q_end <= cutoff
             done_for_model = completed.get(model, set())
             cell_settings = _resolve_settings(model)
+            sample_indices = getattr(settings, "MODEL_SAMPLE_INDICES", {}).get(real_model, {}).get(q.id)
             for s in range(settings.SAMPLING_N):
+                if sample_indices is not None and s not in sample_indices:
+                    continue
                 stats.total += 1
                 key = (q.id, s)
                 if key in done_for_model:
@@ -241,7 +253,9 @@ async def _run_task_with_retry(
         raise
     except _LLMAuthError:
         raise
-    except BaseException as exc:  # noqa: BLE001 — map to row-level error
+    except (asyncio.CancelledError, CollectionBlockedError):
+        raise
+    except Exception as exc:
         kind = classify(exc)
         if kind is ErrorKind.AUTH:
             raise AuthError(str(exc)) from exc
@@ -337,10 +351,48 @@ async def run(
     sampling_n = settings.SAMPLING_N
     models = list(conns.keys())
 
+    deferred_tool_slots = {m: dbmod.load_deferred_tool_failures(conns[m], sampling_n)
+                           if settings.COLLECTION_DEFER_TOOL_FAILURES else set() for m in models}
     # Per-model resume set
     completed: dict[str, set[tuple[str, int]]] = {
-        m: dbmod.load_completed_samples(conns[m], sampling_n) for m in models
+        m: dbmod.load_completed_samples(conns[m], sampling_n,
+            retain_model_refusals=settings.COLLECTION_RETAIN_MODEL_REFUSALS) for m in models
     }
+    for model, conn in conns.items():
+        name = (dbmod.parse_virtual_slug(model) or (model,))[0]
+        target_meta = conn.execute("SELECT * FROM run_meta").fetchone()
+        for reference_path in settings.COLLECTION_REFERENCE_DBS.get(name, []):
+            path = Path(reference_path).resolve()
+            if not path.is_relative_to(Path(settings.RUNS_ROOT).resolve()):
+                raise ValueError("reference DB must remain inside RUNS_ROOT")
+            source = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+            source.row_factory = sqlite3.Row
+            try:
+                meta = source.execute("SELECT * FROM run_meta").fetchone()
+                for key in ("model", "sampling_n", "source_db_hash", "metadata_hash", "prompt_templates_hash", "reflection_protocol_hash", "belief_protocol_hash", "filters_snapshot"):
+                    if meta[key] != target_meta[key]:
+                        raise ValueError(f"reference DB differs in {key}")
+                before = dbmod.collection_contract(json.loads(meta["config_snapshot"]))
+                after = dbmod.collection_contract(json.loads(target_meta["config_snapshot"]))
+                # Detector request controls retain separate source strata.
+                for contract in (before, after):
+                    contract.pop("LEAK_DETECTOR_RESPONSE_FORMAT", None)
+                source_cap = before.get("LEAK_DETECTOR_MAX_TOKENS")
+                target_cap = after.get("LEAK_DETECTOR_MAX_TOKENS")
+                if source_cap is not None and target_cap is not None and source_cap <= target_cap:
+                    for contract in (before, after):
+                        contract.pop("LEAK_DETECTOR_MAX_TOKENS", None)
+                if after.get("LEAK_DETECTOR_DROP_CONTENT_POLICY"):
+                    for contract in (before, after):
+                        contract.pop("LEAK_DETECTOR_DROP_CONTENT_POLICY", None)
+                if before != after:
+                    raise ValueError("reference DB inference contract differs")
+                if settings.COLLECTION_DEFER_TOOL_FAILURES:
+                    deferred_tool_slots[model].update(dbmod.load_deferred_tool_failures(source, sampling_n))
+                completed[model].update(dbmod.load_completed_samples(source, sampling_n,
+                    retain_model_refusals=settings.COLLECTION_RETAIN_MODEL_REFUSALS))
+            finally:
+                source.close()
     todo, cutoff_rows, stats = build_task_plan(
         questions=questions,
         settings=settings,
@@ -348,6 +400,17 @@ async def run(
         run_id=run_id,
         settings_factory=settings_factory,
     )
+    total_pending = len(todo)
+    todo = [task for task in todo
+            if (task.question.id, task.sample_idx) not in deferred_tool_slots[task.model]
+            and (dbmod.parse_virtual_slug(task.model) or (task.model,))[0] not in settings.COLLECTION_PAUSED_PROFILES]
+    if settings.COLLECTION_MODEL:
+        todo = [task for task in todo if
+                (dbmod.parse_virtual_slug(task.model) or (task.model,))[0] == settings.COLLECTION_MODEL]
+    if settings.COLLECTION_SAMPLE_LIMIT:
+        todo = todo[:settings.COLLECTION_SAMPLE_LIMIT]
+    stats.deferred = total_pending - len(todo)
+    stats.planned = len(todo)
 
     logger.info(
         "[run={}] plan: total={} already_done={} skipped_cutoff={} to_run={}",
@@ -367,6 +430,10 @@ async def run(
 
     llm_sem = asyncio.Semaphore(settings.LLM_MAX_CONCURRENCY)
     search_sem = asyncio.Semaphore(settings.SEARCH_MAX_CONCURRENCY)
+    audit_conns = {}
+    for model, conn in conns.items():
+        path = conn.execute("PRAGMA database_list").fetchone()[2]
+        audit_conns[model] = dbmod.connect(path) if path else conn
 
     # Cutoff rows are enqueued first. They flow through each model's writer and
     # inflate the [done/total] denominator in a predictable way.
@@ -377,25 +444,34 @@ async def run(
 
     done_counter = stats.completed_preexisting + stats.skipped_cutoff
     aborted = False
+    admission_closed = asyncio.Event()
 
     async def _worker(task: Task) -> None:
         nonlocal done_counter
-        try:
+        with dbmod.capture_requests(
+            audit_conns[task.model], settings=task.settings, run_id=run_id,
+            model=task.model, question_id=task.question.id, sample_idx=task.sample_idx,
+        ):
             row = await _run_task_with_retry(
-                task,
-                _global_settings=settings,
-                templates=templates,
-                run_id=run_id,
-                llm_semaphore=llm_sem,
-                search_semaphore=search_sem,
+                task, _global_settings=settings, templates=templates, run_id=run_id,
+                llm_semaphore=llm_sem, search_semaphore=search_sem,
             )
-        except AuthError:
-            raise
+            dbmod.audit_event("sample.result", row)
+        kind = row.get("error")
+        retained_refusal = settings.COLLECTION_RETAIN_MODEL_REFUSALS and kind == ErrorKind.CONTENT_POLICY
+        deferred_tool_failure = settings.COLLECTION_DEFER_TOOL_FAILURES and kind == ErrorKind.TOOL_USE_FAILED
+        if deferred_tool_failure:
+            stats.deferred += 1
+        blocks_collection = bool(kind and settings.REQUIRE_HEALTHY_RETRIEVAL
+                                 and not retained_refusal and not deferred_tool_failure)
+        if blocks_collection and settings.COLLECTION_DRAIN_ON_ERROR:
+            admission_closed.set()
         await writers[task.model].enqueue_result(row)
         done_counter += 1
-        kind = row.get("error")
         if kind:
             stats.errors[kind] = stats.errors.get(kind, 0) + 1
+            if blocks_collection:
+                raise CollectionBlockedError(f"sample failed: {kind}; inspect saved request events before resuming")
         _log_progress(
             run_id=run_id,
             done=done_counter,
@@ -405,27 +481,61 @@ async def run(
             row=row,
         )
 
+    pending = iter(todo)
+    started = 0
+
+    async def _draining_worker() -> None:
+        nonlocal started, aborted
+        while not admission_closed.is_set():
+            task = next(pending, None)
+            if task is None:
+                return
+            started += 1
+            try:
+                await _worker(task)
+            except (AuthError, CollectionBlockedError) as exc:
+                admission_closed.set()
+                aborted = True
+                stats.abort_reason = stats.abort_reason or str(exc)
+                logger.error("[run={}] admission stopped; finishing started samples: {}", run_id, exc)
+                return
+
     worker_tasks: list[asyncio.Task] = []
     try:
-        for t in todo:
-            worker_tasks.append(asyncio.create_task(_worker(t)))
+        if settings.COLLECTION_DRAIN_ON_ERROR:
+            worker_tasks = [asyncio.create_task(_draining_worker())
+                            for _ in range(min(len(todo), settings.LLM_MAX_CONCURRENCY))]
+        else:
+            worker_tasks = [asyncio.create_task(_worker(task)) for task in todo]
         for fut in asyncio.as_completed(worker_tasks):
             try:
                 await fut
-            except AuthError:
-                logger.error("[run={}] AUTH error; aborting run", run_id)
+            except (AuthError, CollectionBlockedError) as exc:
+                logger.error("[run={}] collection blocked: {}", run_id, exc)
                 aborted = True
+                stats.abort_reason = str(exc)
                 for t in worker_tasks:
                     t.cancel()
                 break
     finally:
+        for task in worker_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*worker_tasks, return_exceptions=True)
+        if settings.COLLECTION_DRAIN_ON_ERROR:
+            stats.deferred += len(todo) - started
+            stats.planned = started
         for w in writers.values():
             await w.drain()
         for w in writers.values():
             await w.close()
-        if not aborted:
+        for model, conn in audit_conns.items():
+            if conn is not conns[model]:
+                conn.close()
+        if not aborted and not stats.deferred:
             for m, conn in conns.items():
                 dbmod.finish_run_meta(conn, run_id)
 
     stats.done = done_counter
+    stats.aborted = aborted
     return stats

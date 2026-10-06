@@ -1,43 +1,34 @@
-"""CLI entry: `python -m forecast_eval.analysis RUNS_ROOT/{run_id}`.
-
-Kept as a thin wrapper so `run_analysis` stays importable without argparse
-overhead. When ``.env`` is readable, pass the composite difficulty weights
-through to ``run_analysis``; otherwise fall back to default weights
-(synonymous with ``Settings`` defaults).
-"""
+"""CLI for offline fixed-points scoring; no provider credentials are required."""
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
+from loguru import logger
+
+from ..errors import AnalysisContractError
 from . import run_analysis
+from .scoring import CONTRACT
 
 
 def _cli(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="forecast_eval.analysis",
-        description="Compute statistics for one completed evaluation run.",
-    )
-    parser.add_argument("run_dir", help="Path to a RUNS_ROOT/{run_id} directory.")
+    parser = argparse.ArgumentParser(description="Compute fixed Score and forecasting diagnostics.")
+    parser.add_argument("run_dir", type=Path)
+    parser.add_argument("--profiles", nargs="+", help="Explicit manifest model IDs or catalog profile IDs to compare.")
+    parser.add_argument("--allow-incomplete", action="store_true", help="Write coverage diagnostics; unavailable scores stay empty.")
+    parser.add_argument("--bootstrap-iterations", type=int, default=CONTRACT["bootstrap_iterations"])
+    parser.add_argument("--bootstrap-seed", type=int, default=CONTRACT["bootstrap_seed"])
     args = parser.parse_args(argv)
-    kwargs: dict[str, object] = {}
     try:
-        from ..config import load_settings
-
-        cfg = load_settings()
-    except Exception:  # noqa: BLE001 — covers missing .env or unset LLM_API_KEY
-        cfg = None
-    if cfg is not None:
-        kwargs.update(
-            composite_weights=cfg.COMPOSITE_WEIGHTS,
-            composite_overrides=cfg.COMPOSITE_WEIGHT_OVERRIDES,
-        )
-    paths = run_analysis(Path(args.run_dir), **kwargs)
-    for p in paths:
-        print(p)
+        paths = run_analysis(args.run_dir, allow_incomplete=args.allow_incomplete,
+                             bootstrap_iterations=args.bootstrap_iterations, bootstrap_seed=args.bootstrap_seed,
+                             profiles=args.profiles)
+    except (AnalysisContractError, FileNotFoundError) as exc:
+        logger.error("Scoring stopped: {}", exc)
+        return 2
+    logger.info("Scoring report: {}", paths[-1].parent / "score_report.md")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(_cli())
+    raise SystemExit(_cli())

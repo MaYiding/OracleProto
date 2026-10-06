@@ -6,6 +6,7 @@ from enum import StrEnum
 from typing import Any, Optional
 
 import httpx
+from openai import APIConnectionError
 
 
 class ErrorKind(StrEnum):
@@ -14,6 +15,7 @@ class ErrorKind(StrEnum):
     SERVER_5XX = "server_5xx"
     AUTH = "auth"
     BAD_REQUEST = "bad_request"
+    TOOL_USE_FAILED = "tool_use_failed"
     CONTENT_POLICY = "content_policy"
     UNKNOWN = "unknown"
 
@@ -21,10 +23,29 @@ class ErrorKind(StrEnum):
 class AuthError(Exception):
     """Raised once by `llm.chat` when the API key is invalid / forbidden.
 
-    Runner catches this at the top level, cancels all in-flight tasks, flushes
-    the writer, and exits with a non-zero status. Content of the run_results
-    rows depends on runner policy.
+    Runner stops scheduling and exits with a non-zero status. Its collection
+    policy determines whether samples already started finish or are cancelled.
     """
+
+
+class ToolGenerationError(Exception):
+    """The provider rejected generated tool output without returning a completion."""
+
+    def __init__(self, message: str, request_id: str | None = None):
+        super().__init__(message)
+        self.request_id = request_id
+
+
+class CollectionBlockedError(Exception):
+    """Collection cannot preserve its retrieval or persistence contract."""
+
+
+class AnalysisContractError(ValueError):
+    """Stored observations or analysis inputs violate the scoring contract."""
+
+
+class AnalysisIncompleteError(AnalysisContractError):
+    """A declared evaluation panel has missing or failed sample slots."""
 
 
 # Content-policy needles for HTTP 400 bodies.
@@ -83,20 +104,40 @@ def _body_matches(exc: BaseException, needles: tuple[str, ...]) -> bool:
     return any(n in body for n in needles)
 
 
+def tool_generation_message(exc: BaseException) -> str | None:
+    if _status_code(exc) != 400:
+        return None
+    try:
+        body = json.loads(_error_body(exc))
+    except (ValueError, TypeError):
+        return None
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict) or error.get("code") != "tool_use_failed":
+        return None
+    message = error.get("message")
+    if not isinstance(message, str):
+        return None
+    lower = message.lower()
+    if (lower.startswith("tool choice is none, but model called a tool")
+            or (lower.startswith("tool call validation failed:")
+                and "parameters for tool " in lower and "did not match schema" in lower)):
+        return message
+    return None
+
+
 def classify(exc: BaseException) -> ErrorKind:
     """Map an outgoing-HTTP exception to a coarse ErrorKind for retry decisions.
 
-    Network family covers the full httpx transient-failure set: connect /
-    read / write / pool timeouts plus `RemoteProtocolError` (server hung up
-    mid-response) — all of these are bona-fide network blips that earn a
-    retry, not data errors that should fail the sample. Older versions of
-    this function only listed `ConnectError / ReadTimeout / ConnectTimeout /
-    WriteTimeout`, which dropped `RemoteProtocolError` into `UNKNOWN` and the
-    sample failed with no retry.
+    The network family includes httpx transport failures and the OpenAI SDK
+    connection/timeout wrappers. A transport retry keeps the current model
+    context, including search results already obtained for this sample.
     """
+    if isinstance(exc, ToolGenerationError):
+        return ErrorKind.TOOL_USE_FAILED
     if isinstance(
         exc,
         (
+            APIConnectionError,
             httpx.ConnectError,
             httpx.ReadTimeout,
             httpx.ConnectTimeout,
@@ -126,6 +167,8 @@ def classify(exc: BaseException) -> ErrorKind:
             # Spec llm-integration §"Content policy: no retry" pins priority.
             if _body_matches(exc, CONTENT_POLICY_NEEDLES):
                 return ErrorKind.CONTENT_POLICY
+            if tool_generation_message(exc) is not None:
+                return ErrorKind.TOOL_USE_FAILED
             if _body_matches(exc, ("model_not_found", "invalid_request", "invalid request", "invalid model")):
                 return ErrorKind.BAD_REQUEST
             return ErrorKind.BAD_REQUEST

@@ -147,7 +147,7 @@ async def test_smoke_dry_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     src.row_factory = sqlite3.Row
     rows = src.execute(
         "SELECT id, choice_type, question_type, event, options, answer, end_time "
-        "FROM forecast_eval_set_example WHERE question_type='yes_no' ORDER BY end_time LIMIT 3"
+        f"FROM {settings.SOURCE_TABLE} WHERE question_type='yes_no' ORDER BY end_time LIMIT 3"
     ).fetchall()
     src.close()
     ids = tuple(r["id"] for r in rows)
@@ -174,11 +174,12 @@ async def test_smoke_dry_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     templates = loader.sync_prompt_templates(SOURCE_DB, conn)
 
     # Re-load just the 3 targeted questions
-    src = dbmod.connect(SOURCE_DB)
+    src = sqlite3.connect(f"file:{SOURCE_DB}?mode=ro", uri=True)
+    src.row_factory = sqlite3.Row
     placeholders = ",".join("?" * len(ids))
     questions_rows = src.execute(
         f"SELECT id, choice_type, question_type, event, options, answer, end_time "
-        f"FROM forecast_eval_set_example WHERE id IN ({placeholders}) ORDER BY end_time",
+        f"FROM {settings.SOURCE_TABLE} WHERE id IN ({placeholders}) ORDER BY end_time",
         ids,
     ).fetchall()
     src.close()
@@ -259,12 +260,20 @@ async def test_smoke_dry_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
 
     # Tavily must have been called with the correct end_date (= end_time + OFFSET)
     assert tavily_route.called
-    first_call_body = json.loads(tavily_route.calls[0].request.content.decode("utf-8"))
-    first_question_end = questions[0].end_time
     from datetime import date, timedelta
-    expected_end_date = (date.fromisoformat(first_question_end) + timedelta(days=-1)).isoformat()
-    assert first_call_body["end_date"] == expected_end_date
-    assert first_call_body["include_raw_content"] is False
+    expected_end_dates = {
+        (date.fromisoformat(q.end_time) + timedelta(days=-1)).isoformat()
+        for q in questions
+    }
+    observed_end_dates = {
+        json.loads(call.request.content.decode("utf-8"))["end_date"]
+        for call in tavily_route.calls
+    }
+    assert observed_end_dates == expected_end_dates
+    assert all(
+        json.loads(call.request.content.decode("utf-8"))["include_raw_content"] is False
+        for call in tavily_route.calls
+    )
 
     # run_meta.finished_at set on normal completion
     r = conn.execute("SELECT finished_at FROM run_meta WHERE run_id=?", (run_id,)).fetchone()

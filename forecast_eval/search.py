@@ -8,15 +8,20 @@ import httpx
 from loguru import logger
 
 from .config import Settings
+from .db import audit_event
+from .errors import CollectionBlockedError
 from .tavily_keys import AllKeysExhausted, TavilyKeyPool, get_pool
 
 
 TAVILY_ENDPOINT = "https://api.tavily.com/search"
 # Tavily uses 401 / 403 to signal an invalid key or permission issue (permanent
 # blacklist); 429 / quota-related responses also use 429 (temporary cooldown).
-# Other status codes fall into "other" (network / server errors).
+# Recognized query validation failures belong to the tool caller, not the key.
 _AUTH_STATUS = frozenset({401, 403})
 _RATE_LIMIT_STATUS = frozenset({429})
+_SITE_ONLY_QUERY_ERROR = (
+    "Query cannot consist only of site: operators. Please provide search terms."
+)
 
 
 @dataclass
@@ -47,6 +52,7 @@ class SearchResult:
     # field so dataclass field-ordering rules stay satisfied. NOT exposed via
     # to_llm_payload() — the audit dict is for search_calls JSON only.
     audit: dict[str, Any] | None = None
+    raw_response: dict[str, Any] | None = None
 
     @property
     def ok(self) -> bool:
@@ -127,7 +133,7 @@ def _parse_tavily_response(
                 raw_content=rc_str,
             )
         )
-    return SearchResult(query=query, end_date=end_date, answer=answer, results=items)
+    return SearchResult(query=query, end_date=end_date, answer=answer, results=items, raw_response=data)
 
 
 def _build_request_payload(
@@ -170,13 +176,34 @@ async def _single_request(
     settings: Settings,
     api_key: str,
 ) -> httpx.Response:
-    return await client.post(
-        TAVILY_ENDPOINT,
-        json=_build_request_payload(
-            query=query, end_date=end_date, settings=settings, api_key=api_key
-        ),
-        timeout=settings.LLM_TIMEOUT_S,
-    )
+    payload = _build_request_payload(query=query, end_date=end_date, settings=settings, api_key=api_key)
+    request_id = audit_event("search.request", {
+        "endpoint": TAVILY_ENDPOINT, "body": {k: v for k, v in payload.items() if k != "api_key"},
+    })
+    try:
+        response = await client.post(TAVILY_ENDPOINT, json=payload, timeout=settings.LLM_TIMEOUT_S)
+    except asyncio.CancelledError:
+        audit_event("search.cancelled", {}, request_id=request_id)
+        raise
+    except Exception as exc:
+        audit_event("search.error", {"type": type(exc).__name__, "message": str(exc)}, request_id=request_id)
+        raise
+    audit_event("search.response", {"status": response.status_code, "body": response.text}, request_id=request_id)
+    return response
+
+
+def _query_validation_error(response: httpx.Response) -> dict[str, Any] | None:
+    """Only an explicit query rejection is safe to return as a tool error."""
+    if response.status_code != 400:
+        return None
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, dict) and detail.get("error") == _SITE_ONLY_QUERY_ERROR:
+        return body
+    return None
 
 
 async def tavily_search(
@@ -196,13 +223,16 @@ async def tavily_search(
       retry**, immediately swap key and try again (no sleep).
     - 429 -> temporarily cool down that key, also immediately swap key and
       try again.
+    - Explicit HTTP 400 site-only query rejection -> return `invalid_query`
+      without retrying or penalizing the key; the ReAct search budget is consumed.
     - 5xx / network / bad-JSON -> consumes the `SEARCH_RETRY_MAX` network-retry
       quota, sleeps per `SEARCH_BACKOFF_S` then retries (key not blacklisted).
     - All keys unavailable (AllKeysExhausted) -> return the error immediately,
       no further rotation.
 
-    The return value is still a `SearchResult` (does not raise), so the ReAct
-    loop can feed tool_result back into the LLM.
+    Query validation errors return `SearchResult` for the ReAct tool cycle.
+    Unavailable retrieval raises `CollectionBlockedError` when strict collection
+    is enabled; otherwise it returns an error result.
     """
     owns_client = client is None
     if owns_client:
@@ -231,6 +261,8 @@ async def tavily_search(
             try:
                 api_key = await pool.acquire()
             except AllKeysExhausted as e:
+                if getattr(settings, "REQUIRE_HEALTHY_RETRIEVAL", False):
+                    raise CollectionBlockedError("Tavily key pool exhausted; collection paused") from e
                 last_error_kind = "all_keys_exhausted"
                 last_error_message = str(e)
                 logger.warning("tavily {}", last_error_message)
@@ -264,6 +296,16 @@ async def tavily_search(
                 network_class_error = True
             else:
                 status = resp.status_code
+                query_error = _query_validation_error(resp)
+                if query_error is not None:
+                    await pool.report_ok(api_key)
+                    return SearchResult(
+                        query=query,
+                        end_date=end_date,
+                        error_kind="invalid_query",
+                        error_message=_SITE_ONLY_QUERY_ERROR,
+                        raw_response=query_error,
+                    )
                 if status == 200:
                     try:
                         data = resp.json()
@@ -293,7 +335,7 @@ async def tavily_search(
                                 settings=settings,
                             )
                         return result
-                elif status in _AUTH_STATUS:
+                elif status in _AUTH_STATUS or status in (432, 433):
                     await pool.report_failure(api_key, "auth")
                     last_error_kind = "auth"
                     last_error_message = f"HTTP {status}: {resp.text[:500]}"
@@ -333,6 +375,8 @@ async def tavily_search(
         if owns_client:
             await client.aclose()
 
+    if getattr(settings, "REQUIRE_HEALTHY_RETRIEVAL", False):
+        raise CollectionBlockedError(f"Tavily unavailable: {last_error_kind}; collection paused")
     return SearchResult(
         query=query,
         end_date=end_date,

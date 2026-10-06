@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import re
 from datetime import date
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -244,6 +245,30 @@ def _parse_cutoffs(raw: str | dict[str, Any] | None) -> dict[str, date]:
     return out
 
 
+class ModelProfile(BaseModel):
+    """Provider identity and explicit inference settings for one experiment arm."""
+
+    model_config = ConfigDict(extra="forbid")
+    model: str
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"] | None = None
+    reasoning_max_tokens: int | None = Field(default=None, gt=0)
+    replay_reasoning: bool = True
+    """Whether the provider accepts returned reasoning fields in message history."""
+    force_tool_choice_none: bool = False
+    """Whether tool-free finalization needs an explicit tool_choice=none."""
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    top_p: float | None = Field(default=None, gt=0, le=1)
+    max_tokens_param: Literal["max_tokens", "max_completion_tokens"] | None = None
+    omit_sampling_fields: list[Literal["temperature", "top_p"]] | None = None
+
+    @field_validator("model")
+    @classmethod
+    def _safe_model(cls, value: str) -> str:
+        if not value or ":online" in value or "::" in value:
+            raise ValueError("provider model must be nonempty and cannot enable browsing")
+        return value
+
+
 class Settings(BaseSettings):
     """Runtime configuration loaded once from `.env`.
 
@@ -259,10 +284,21 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    @field_validator("MODEL_PROFILES", "MODEL_QUESTION_IDS", "MODEL_SAMPLE_INDICES", mode="before")
+    @classmethod
+    def _parse_profiles(cls, value: Any) -> Any:
+        return json.loads(value) if isinstance(value, str) and value.strip() else (value or {})
+
     # LLM (any OpenAI-compatible endpoint)
     LLM_API_KEY: str
     LLM_BASE_URL: str = "https://openrouter.ai/api/v1"
     MODELS: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    MODEL_PROFILES: Annotated[dict[str, ModelProfile], NoDecode] = Field(default_factory=dict)
+    """Experiment-arm IDs mapped to provider models and fixed reasoning parameters."""
+    MODEL_QUESTION_IDS: Annotated[dict[str, list[str]], NoDecode] = Field(default_factory=dict)
+    """Optional per-arm question allowlists; absent arms use the full dataset."""
+    MODEL_SAMPLE_INDICES: Annotated[dict[str, dict[str, list[int]]], NoDecode] = Field(default_factory=dict)
+    """Optional per-question sample slots, allowing a failed slot to be repaired alone."""
     MODEL_TRAINING_CUTOFFS: Annotated[dict[str, date], NoDecode] = Field(default_factory=dict)
     LLM_MAX_TOKENS: int = 12000
     # Some providers (e.g., OpenAI official o-series / GPT-5 on /v1/chat/completions)
@@ -393,6 +429,10 @@ class Settings(BaseSettings):
     LEAK_DETECTOR_BASE_URL: str = ""
     # Detector model slug. ":online" suffix is not allowed (provider-native browsing protection).
     LEAK_DETECTOR_MODEL: str = ""
+    LEAK_DETECTOR_RESPONSE_FORMAT: Literal["json_object"] | None = None
+    """Optional provider JSON constraint; independent of the detector prompt text."""
+    LEAK_DETECTOR_REASONING_EFFORT: Literal["none", "minimal", "low", "medium", "high", "xhigh"] | None = None
+    """Explicit detector reasoning control; None retains the provider default."""
     LEAK_DETECTOR_TIMEOUT_S: int = 60
     LEAK_DETECTOR_TEMPERATURE: float = 0.0
     LEAK_DETECTOR_MAX_TOKENS: int = 512
@@ -400,6 +440,8 @@ class Settings(BaseSettings):
     LEAK_DETECTOR_BACKOFF_S: Annotated[list[int], NoDecode] = Field(default_factory=lambda: [2, 5, 15])
     # drop = remove failed items (default, fail-closed); keep = pass through failed items (escape hatch).
     LEAK_DETECTOR_FAIL_ACTION: str = "drop"
+    LEAK_DETECTOR_DROP_CONTENT_POLICY: bool = False
+    """Drop provider-refused items without aborting strict collection; retain the failed verdict."""
     LEAK_DETECTOR_CONCURRENCY: int = 5
     # Manual version label; sha256(prompt_template) is auto-hashed; this is a human-readable label.
     LEAK_DETECTOR_PROMPT_VERSION: str = "v1"
@@ -434,15 +476,41 @@ class Settings(BaseSettings):
 
     # Sampling / Run
     SAMPLING_N: int = 5
+    SCORE_ANSWERS: bool = True
+    """Whether collection computes correctness against gold answers."""
+    WRITE_REQUEST_AUDIT: bool = True
+    """Persist every HTTP attempt and sample outcome in the model database."""
+    REQUIRE_HEALTHY_RETRIEVAL: bool = False
+    """Stop collection on exhausted retrieval keys or detector failures."""
     RUN_ID: str = ""
     RESUME: bool = True
+    COLLECTION_MODEL: str = ""
+    """Optional profile to dispatch in this process; other profiles remain pending."""
+    COLLECTION_SAMPLE_LIMIT: int = Field(default=0, ge=0)
+    """Maximum new samples per dispatch, with zero meaning unlimited."""
+    COLLECTION_RETAIN_MODEL_REFUSALS: bool = False
+    """Keep forecast-provider content refusals as terminal observations, without retrying their slots."""
+    COLLECTION_DEFER_TOOL_FAILURES: bool = False
+    """Continue other slots after exhausted generated-tool errors; keep failed slots pending."""
+    COLLECTION_PAUSED_PROFILES: list[str] = Field(default_factory=list)
+    """Profiles whose pending slots stay in coverage but are not automatically dispatched."""
+    COLLECTION_DRAIN_ON_ERROR: bool = False
+    """Stop admitting samples after a fatal error while finishing samples already started."""
+    COLLECTION_EXPENSIVE_CONCURRENCY: int = Field(default=1, ge=1, le=20)
+    """Sample concurrency for expensive profiles in the collection dispatcher."""
+    COLLECTION_BATCH_SAMPLES: int = Field(default=60, ge=3, le=300)
+    """Maximum samples in a normal collection batch after the three-sample pilot."""
+    COLLECTION_REFERENCE_DBS: dict[str, list[str]] = Field(default_factory=dict)
+    """Read-only prior collection strata whose completed slots must not be repeated."""
 
     # Database
     SOURCE_DB: str = "./forecast_eval_set_example.db"
     # Question table inside SOURCE_DB. The bundled example DB ships with
-    # `forecast_eval_set_example`; bring-your-own datasets can point at any other
+    # `test_cases`; bring-your-own datasets can point at any other
     # table name as long as it has the same 7-column schema (see FRAME.md §2.1).
-    SOURCE_TABLE: str = "forecast_eval_set_example"
+    SOURCE_TABLE: str = "test_cases"
+    PROMPT_TEMPLATE_STYLE: Literal["typed", "shared"] = "typed"
+    """Dataset outer-template schema, retained verbatim for reproducible prompts."""
     # Every evaluation gets its own folder at RUNS_ROOT/{run_id}/, containing one
     # SQLite file per model under db/, plus analysis/ (post-run statistics) and
     # logs/. The old single-file RESULTS_DB layout is gone — see FRAME.md §5/§6.
@@ -630,8 +698,27 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _post_validate(self) -> "Settings":
+        if self.COLLECTION_RETAIN_MODEL_REFUSALS and not self.WRITE_REQUEST_AUDIT:
+            raise ValueError("COLLECTION_RETAIN_MODEL_REFUSALS requires WRITE_REQUEST_AUDIT")
+        if self.COLLECTION_DEFER_TOOL_FAILURES and not self.WRITE_REQUEST_AUDIT:
+            raise ValueError("COLLECTION_DEFER_TOOL_FAILURES requires WRITE_REQUEST_AUDIT")
         if not self.MODELS:
             raise ValueError("MODELS must not be empty")
+        if set(self.COLLECTION_PAUSED_PROFILES) - set(self.MODELS):
+            raise ValueError("COLLECTION_PAUSED_PROFILES must be declared in MODELS")
+        if len(set(self.COLLECTION_PAUSED_PROFILES)) != len(self.COLLECTION_PAUSED_PROFILES):
+            raise ValueError("COLLECTION_PAUSED_PROFILES must be unique")
+        if set(self.MODEL_PROFILES) - set(self.MODELS):
+            raise ValueError("MODEL_PROFILES keys must be declared in MODELS")
+        if set(self.MODEL_SAMPLE_INDICES) - set(self.MODELS):
+            raise ValueError("MODEL_SAMPLE_INDICES keys must be declared in MODELS")
+        for model, questions in self.MODEL_SAMPLE_INDICES.items():
+            allowed = self.MODEL_QUESTION_IDS.get(model)
+            for question_id, indices in questions.items():
+                if allowed is not None and question_id not in allowed:
+                    raise ValueError("sample-slot question must be in MODEL_QUESTION_IDS")
+                if not indices or len(indices) != len(set(indices)) or any(i < 0 or i >= self.SAMPLING_N for i in indices):
+                    raise ValueError("sample slots must be unique indices below SAMPLING_N")
         for slug in self.MODELS:
             if slug.endswith(":online"):
                 raise ValueError(

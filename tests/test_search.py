@@ -8,6 +8,7 @@ import httpx
 import pytest
 import respx
 
+from forecast_eval.errors import CollectionBlockedError
 from forecast_eval.search import (
     SearchResult,
     SearchResultItem,
@@ -47,6 +48,7 @@ class _StubSettings:
     # search-leak-filter-v1: off by default, take the non-detector path; tests
     # explicitly enable it when needed.
     ENABLE_SEARCH_LEAK_FILTER: bool = False
+    REQUIRE_HEALTHY_RETRIEVAL: bool = False
 
     def __post_init__(self) -> None:
         if self.SEARCH_BACKOFF_S is None:
@@ -309,6 +311,45 @@ async def test_tavily_search_exhausted_returns_error_payload() -> None:
     payload = result.to_llm_payload()
     assert payload["error"] == "tavily_error"
     assert payload["results"] == []
+
+
+@pytest.mark.parametrize("strict", [False, True])
+@respx.mock
+async def test_site_only_query_returns_tool_error_without_retry_or_key_penalty(strict, monkeypatch):
+    body = {"detail": {"error": "Query cannot consist only of site: operators. Please provide search terms."}}
+    route = respx.post(TAVILY_ENDPOINT).respond(400, json=body)
+    settings = _StubSettings(REQUIRE_HEALTHY_RETRIEVAL=strict, ENABLE_SEARCH_LEAK_FILTER=True)
+    pool = TavilyKeyPool.from_keys(settings.TAVILY_API_KEY)
+    from forecast_eval import leak_filter
+    monkeypatch.setattr(leak_filter, "filter_search_result", lambda *a, **k: pytest.fail("no results to filter"))
+    query = "site:androidcentral.com/phones/google-pixel-11"
+    result = await tavily_search(query, "2026-08-19", settings, pool=pool)
+    assert route.call_count == 1
+    assert not result.ok and result.error_kind == "invalid_query"
+    assert result.raw_response == body
+    assert result.to_llm_payload() == {"error": "invalid_query", "message": body["detail"]["error"],
+                                       "results": [], "answer": None}
+    request = json.loads(route.calls.last.request.content)
+    assert request["query"] == query and request["end_date"] == "2026-08-19"
+    assert pool.states[0].used == 1 and not pool.states[0].blacklisted
+    assert pool.states[0].cooldown_until == 0
+
+
+@pytest.mark.parametrize("status,body,attempts", [
+    (400, {"detail": {"error": "Account quota exhausted"}}, 3),
+    (400, {"detail": ["Unexpected query validation schema"]}, 3),
+    (400, None, 3),
+    (401, {"detail": {"error": "Query cannot consist only of site: operators. Please provide search terms."}}, 1),
+    (429, {"detail": {"error": "Query cannot consist only of site: operators. Please provide search terms."}}, 1),
+    (503, {"detail": {"error": "Query cannot consist only of site: operators. Please provide search terms."}}, 3),
+])
+@respx.mock
+async def test_other_tavily_failures_still_block_strict_collection(status, body, attempts):
+    response = httpx.Response(status, json=body) if body is not None else httpx.Response(status, text="invalid JSON")
+    route = respx.post(TAVILY_ENDPOINT).mock(return_value=response)
+    with pytest.raises(CollectionBlockedError):
+        await tavily_search("site:example.org", "2026-08-19", _StubSettings(REQUIRE_HEALTHY_RETRIEVAL=True))
+    assert route.call_count == attempts
 
 
 @respx.mock

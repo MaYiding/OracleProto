@@ -9,9 +9,12 @@ from loguru import logger
 from openai import AsyncOpenAI
 
 from .config import Settings
+from .db import audit_event
 from .errors import (
     AuthError,
     ErrorKind,
+    ToolGenerationError,
+    tool_generation_message,
     backoff_seconds,
     classify,
     parse_retry_after,
@@ -60,6 +63,7 @@ def get_client(settings: Settings) -> AsyncOpenAI:
         _client = AsyncOpenAI(
             api_key=settings.LLM_API_KEY,
             base_url=settings.LLM_BASE_URL,
+            max_retries=0,
         )
     return _client
 
@@ -106,6 +110,35 @@ def _serialise_message(msg: Any) -> dict[str, Any]:
     raise TypeError(f"cannot serialise message of type {type(msg)!r}")
 
 
+def _wire_messages(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    wire = list(messages)
+    normalizations = []
+    for message_index, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        for call_index, call in enumerate(message.get("tool_calls") or []):
+            function = call.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            if isinstance(name, str) and name.strip():
+                continue
+            # ReAct rejects this call as unknown. A non-executable label lets
+            # providers parse its history without inventing a valid search.
+            if wire[message_index] is message:
+                wire[message_index] = {**message, "tool_calls": list(message["tool_calls"])}
+            wire[message_index]["tool_calls"][call_index] = {
+                **call, "function": {**function, "name": "invalid_tool_call"},
+            }
+            normalizations.append({
+                "message_index": message_index, "tool_call_index": call_index,
+                "tool_call_id": call.get("id"), "field": "function.name",
+                "original_present": "name" in function, "original_value": name,
+                "wire_value": "invalid_tool_call",
+            })
+    return wire, normalizations
+
+
 def _extract_usage(raw_usage: Any) -> Usage:
     if raw_usage is None:
         return Usage()
@@ -146,6 +179,17 @@ async def chat(
     """
     tools = tools if tools is not None else [WEB_SEARCH_SCHEMA]
     extra_body: dict[str, Any] = {}
+    profile = (getattr(settings, "MODEL_PROFILES", {}) or {}).get(model)
+    if profile is not None:
+        model = profile.model
+        if not profile.replay_reasoning:
+            messages = [{key: value for key, value in message.items()
+                         if key not in ("reasoning_content", "reasoning_details")}
+                        for message in messages]
+        if profile.reasoning_effort is not None:
+            extra_body["reasoning_effort"] = profile.reasoning_effort
+        if profile.reasoning_max_tokens is not None:
+            extra_body["reasoning"] = {"max_tokens": profile.reasoning_max_tokens}
     _assert_no_browsing(model=model, tools=tools, extra_body=extra_body)
 
     c = client or get_client(settings)
@@ -164,6 +208,9 @@ async def chat(
     max_tokens_param = (
         getattr(settings, "MODEL_MAX_TOKENS_PARAM", {}) or {}
     ).get(model, "max_tokens")
+    if profile is not None and profile.max_tokens_param is not None:
+        max_tokens_param = profile.max_tokens_param
+    messages, message_normalizations = _wire_messages(messages)
     base_kwargs: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -175,25 +222,48 @@ async def chat(
     # ENABLE_WEB_SEARCH=false.
     if tools:
         base_kwargs["tools"] = tools
+    elif profile is not None and profile.force_tool_choice_none:
+        base_kwargs["tool_choice"] = "none"
+    if extra_body:
+        base_kwargs["extra_body"] = extra_body
     if not skip_sampling:
         omit_fields = set(
             (getattr(settings, "MODEL_OMIT_SAMPLING_FIELDS", {}) or {}).get(model, [])
         )
+        if profile is not None and profile.omit_sampling_fields is not None:
+            omit_fields = set(profile.omit_sampling_fields)
+        profile_temperature = profile.temperature if profile is not None else None
+        profile_top_p = profile.top_p if profile is not None else None
         if "temperature" not in omit_fields:
             base_kwargs["temperature"] = (
-                temperature if temperature is not None else settings.LLM_TEMPERATURE
+                temperature if temperature is not None else
+                (profile_temperature if profile_temperature is not None else settings.LLM_TEMPERATURE)
             )
         if "top_p" not in omit_fields:
-            base_kwargs["top_p"] = top_p if top_p is not None else settings.LLM_TOP_P
+            base_kwargs["top_p"] = top_p if top_p is not None else (profile_top_p if profile_top_p is not None else settings.LLM_TOP_P)
 
     while True:
         attempt += 1
+        wire_body = {k: v for k, v in base_kwargs.items() if k not in ("timeout", "extra_body")}
+        request_id = audit_event("llm.request", {
+            "endpoint": str(settings.LLM_BASE_URL).rstrip("/") + "/chat/completions",
+            "body": {**wire_body, **extra_body}, "attempt": attempt,
+            **({"message_normalizations": message_normalizations} if message_normalizations else {}),
+        })
         try:
             raw = await c.chat.completions.with_raw_response.create(**base_kwargs)
-        except BaseException as exc:  # noqa: BLE001 — we re-raise after classification
+        except asyncio.CancelledError:
+            audit_event("llm.cancelled", {}, request_id=request_id)
+            raise
+        except Exception as exc:
+            audit_event("llm.error", {"type": type(exc).__name__, "message": str(exc),
+                        "status": getattr(exc, "status_code", None),
+                        "body": getattr(getattr(exc, "response", None), "text", None)}, request_id=request_id)
             kind = classify(exc)
             if kind is ErrorKind.AUTH:
                 raise AuthError(str(exc)) from exc
+            if kind is ErrorKind.TOOL_USE_FAILED:
+                raise ToolGenerationError(tool_generation_message(exc) or str(exc), request_id) from exc
             last_exc = exc
             if not should_retry(kind):
                 raise
@@ -212,6 +282,8 @@ async def chat(
             await asyncio.sleep(wait)
             continue
 
+        audit_event("llm.response", {"status": getattr(raw, "status_code", None),
+                    "body": getattr(raw, "text", None)}, request_id=request_id)
         parsed = raw.parse()
         headers = getattr(raw, "headers", httpx.Headers())
         message = _serialise_message(parsed.choices[0].message)
