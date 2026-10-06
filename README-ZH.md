@@ -56,11 +56,20 @@ forecast_eval/                       # 核心代码
 ├─ db.py / loader.py                 # SQLite schema 迁移 / 数据集同步
 └─ tavily_keys.py / tools.py         # API key 轮转 / 工具 schema
 evaluation.py                        # 入口
-scripts/                             # 离线工具
+scripts/                             # 数据集、面板、敏感性分析与绘图工具
 tests/                               # 测试
 runs/, logs/                         # 运行产物
 forecast_eval_set_example.db         # 样例数据集
 ```
+
+可复用脚本从 `.env` 读取数据集配置，或通过参数接收输入和输出路径。
+
+| 脚本 | 用途 |
+| --- | --- |
+| `scripts/build_forecast_eval_set.py` | 使用 `SOURCE_PARQUET`、`SOURCE_DB`、`SOURCE_TABLE` 和 `SOURCE_MIN_END_DATE` 构建并校验源数据集。 |
+| `scripts/build_panel_analysis.py` | 按[面板清单](panels/README-ZH.md)汇集声明运行中的模型数据库。 |
+| `scripts/fss_sensitivity.py` | 按指定的错选和漏选惩罚重新计算 FSS。 |
+| `scripts/plot_analysis.py` | 为指定运行中已有的分析 CSV/JSON 产物绘图。 |
 
 ---
 
@@ -149,13 +158,11 @@ runs/{run_id}/
 └─ logs/{run_id}.log
 ```
 
-原始采集及委派结果全部齐备后执行：
+对已完成的运行执行评分：
 
 ```bash
 python -B -m forecast_eval.analysis runs/{run_id}
 ```
-
-分批采集的统一入口是 `python -B -m forecast_eval.analysis runs/collection_300/catalog.json --profiles PROFILE_ID ...`。先由采集会话刷新 catalog，再明确选定已完成的配置；catalog 可能同时列出尚未开始的 reasoning 配置。评分会校验题库与观测导出的哈希，保留参考、续跑、补录和过滤分层。结果写入 `runs/collection_300/analysis/score/`。
 
 `score_report.md` 与 `score_summary.csv` 报告共同题目上的模型表现。`score_by_type.csv` 列出四类题型；`selection_diagnostics.csv` 区分错选、漏选和替换；`score_by_trial.csv` 及 pass/vote 列描述重复作答。指标定义见[评分契约](data/results/benchmark_manifest.json)，输出字段对应[报告实现](forecast_eval/analysis/score_report.py)。
 
@@ -204,32 +211,10 @@ python -B -m forecast_eval.analysis runs/{run_id}
 
 设置 `SCORE_ANSWERS=false` 并执行 `python evaluation.py --skip-analysis`，即可采集答案而不计算正确性或指标。`WRITE_REQUEST_AUDIT=true` 将请求尝试与响应保存在每个模型 DB 内；`REQUIRE_HEALTHY_RETRIEVAL=true` 在搜索或过滤模型无法履行检索契约时停止采集。恢复运行要求题库、提示词、思考配置及采集预算一致。
 
-`PROMPT_TEMPLATE_STYLE=shared` 显式选择共用一个外层模板的题库；默认 `typed` 要求四个按题型区分的模板。`python scripts/collect_forecast_panel.py run` 按准备好的续跑计划分小批采集，优先运行便宜模型。`COLLECTION_MODEL` 与 `COLLECTION_SAMPLE_LIMIT` 限制调度范围，不改变单个样本预算。思考档位扩展单独准备，等待补充额度。
+`COLLECTION_MODEL` 选择一个配置进行调度。`COLLECTION_SAMPLE_LIMIT` 限制单次启动新增的样本数，零表示不限。设置 `RUN_ID` 即可在同一运行中恢复待处理槽位。`COLLECTION_PAUSED_PROFILES` 暂停指定配置，其余配置继续运行。`MODEL_QUESTION_IDS` 与 `MODEL_SAMPLE_INDICES` 将调度限制在声明的题目和采样槽位内。
 
-调整采集吞吐时，原子替换 `runs/collection_300/dispatch_control.json` 中的并发覆盖值，例如 `{"LEAK_DETECTOR_CONCURRENCY": 10}`。采集器在下一小批开始前读取。`SIGTERM` 请求在当前小批完成后停止；用相同运行命令续跑待完成样本槽。实际设置保存在运行目录的 `dispatches.jsonl`。
+`COLLECTION_DRAIN_ON_ERROR=true` 在终止性故障后停止接收新样本，已开始的样本继续完成。`COLLECTION_RETAIN_MODEL_REFUSALS=true` 保留预测供应商的内容拒绝，并在恢复时跳过这些槽位。`COLLECTION_DEFER_TOOL_FAILURES=true` 在供应商拒绝工具生成并耗尽固定预算后继续其他槽位，将失败槽位留为待处理。拒绝留存和工具失败延后处理均要求启用请求审计。
 
-`COLLECTION_EXPENSIVE_CONCURRENCY` 单独设置昂贵配置的采样并发，也支持在小批边界覆盖。`COLLECTION_DRAIN_ON_ERROR=true` 时，终止性失败会停止接收待执行样本，已开始的样本继续完成并留存证据。失败槽位保持未解决状态，采集器等这些样本收尾后停止。
-
-延后或交给其他执行者的配置可通过 `runs/collection_300/local_queue_exclusions.json` 从本机队列排除，文件指定 `run_id` 和 `profiles`。运行目录中的 `local_queue_exclusions.json` 可为该运行追加排除项，不替换另一个运行的队列设置。每个小批前检查排除列表；运行目录的 `local_queue_state.json` 记录启动队列及 PID。仍有排除的任务时，批次状态保持 `local_queue_complete_pending_delegation`。
-
-`COLLECTION_BATCH_SAMPLES` 控制 3 次采样试跑之后的普通批次大小，默认 60。增大它可以减少批次间等待最后一个慢样本的频率；同时在途的样本数仍受独立并发上限约束。昂贵配置保持每批 15 次，所有批次仍受剩余槽位和搜索额度预留限制。控制文件可在批次边界覆盖此设置。
-
-收到委派结果后，先核对发送方校验清单并确认采集已停止，再将 `delegated_results.json` 中对应项设为 `verified_return`，填写以项目相对路径为键的 `returned_artifacts` SHA-256 映射。catalog 核对固定任务、执行快照、原始日志和推理契约后，将回传运行作为独立来源收录。未经核对的回传仍记为待接收。
-
-`COLLECTION_RETAIN_MODEL_REFUSALS=true` 留存预测供应商的内容拒绝，并继续其他样本槽。该开关要求启用请求审计，恢复时跳过已留存的拒绝。catalog 将拒绝与预测分开统计；除启用生成工具失败延后处理外，其他终止性错误仍停止严格采集。
-
-`COLLECTION_PAUSED_PROFILES` 列出需要暂缓的已授权配置，其他配置可继续执行。暂缓配置的剩余槽位保留为待完成，等待明确恢复。在采集计划的 `runtime` 中设置该列表。
-
-`COLLECTION_DEFER_TOOL_FAILURES=true` 允许在模型因供应商拒绝其生成的工具调用而耗尽固定轮数后，继续采集其他槽位。失败槽位保留请求证据并保持待处理状态，既不计为完成，也不自动重试。该选项要求请求审计。搜索、鉴权、额度及其他服务故障仍停止严格采集。
-
-`LEAK_DETECTOR_RESPONSE_FORMAT=json_object` 向支持该选项的过滤模型接口请求有效 JSON。`python scripts/catalog_collection.py` 在 `runs/collection_300/catalog.json` 中关联参考样本和采集样本，按一致的字段名导出观测记录，保留来源分层和原始值，不计算评分。其中的覆盖清单标识每个尚未完成的模型、题目和采样序号组合。观测导出采用 gzip 无损压缩。
-
-`LEAK_DETECTOR_DROP_CONTENT_POLICY=true` 丢弃过滤模型供应商拒绝处理的页面。判定保留为 `failed:content_policy`，原始页面与拒绝记录一并保存。其他过滤错误仍会停止严格采集。此选项使用独立采集分层。
-
-300 题采集设置 `LEAK_DETECTOR_MAX_TOKENS=2048`。不同过滤输出上限使用独立运行目录；`COLLECTION_REFERENCE_DBS` 可复用较低上限分层中已完成的样本，同时保留两种配置。
-
-`python scripts/collect_forecast_panel.py plan --phase repair` 为参考数据中已记录的失败准备独立补录。`MODEL_SAMPLE_INDICES` 将每题限制到失败样本槽，保留已完成样本和声明的采样次数。补录运行共用采集锁，在当前采集器释放锁后启动。
-
-保留原题的面板流程依次使用 `python scripts/prepare_collection.py`、`python scripts/collect_forecast_panel.py plan`、`python scripts/probe_collection.py` 与 `python scripts/collect_forecast_panel.py run`。本地计划和来源清单位于 `runs/collection_300/`；`python scripts/collect_forecast_panel.py status` 只报告采集数量，不评分。API 凭据保存在 `.env`。
+`PROMPT_TEMPLATE_STYLE=shared` 选择使用共用外层模板的数据集；默认 `typed` 要求四类题型各自的模板。`LEAK_DETECTOR_RESPONSE_FORMAT=json_object` 向支持该选项的过滤模型接口请求 JSON。`LEAK_DETECTOR_MAX_TOKENS` 设置其输出上限。`LEAK_DETECTOR_DROP_CONTENT_POLICY=true` 丢弃过滤模型供应商拒绝处理的网页，同时保留原文与拒绝记录；其他过滤失败仍停止严格采集。过滤响应格式、输出上限或拒绝处理规则不同的配置应使用独立运行；`COLLECTION_REFERENCE_DBS` 可复用已完成样本并保留其来源配置。
 
 </details>

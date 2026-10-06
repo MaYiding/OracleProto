@@ -1,4 +1,4 @@
-"""Phase 1 of `react-tavily-grid-search` — `forecast_eval/analysis/grid.py` tests.
+"""Tests for `forecast_eval/analysis/grid.py`.
 
 The fixture builds a tiny 2×2×2 grid (2 real_models × 2 R × 2 C = 8 virtual
 slugs) entirely in memory: SampleRow / _QuestionProbabilityRow are
@@ -6,9 +6,8 @@ constructed by hand so we don't pay sqlite + flatten roundtrip cost on every
 test. Cells get distinct BI values so pareto / winrate / marginals are
 non-trivial.
 
-`run_grid_analysis` legacy compat (task 10.7) is asserted on the in-memory
-path. The reflection-A/B isolation test (task 10.8) is the one place we
-need real DBs because `find_paired_runs` reads `run_meta` rows directly.
+`run_grid_analysis` is exercised with in-memory samples. The reflection-A/B
+isolation test uses real DBs because `find_paired_runs` reads `run_meta` rows directly.
 """
 from __future__ import annotations
 

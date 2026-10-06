@@ -39,6 +39,6 @@ filterwarnings = [
     # Cell-local Settings sub-views (TAVILY_MAX_RESULTS / REACT_MAX_SEARCH_CALLS
     # downcast from list[int] to int by the grid dispatcher) trigger a
     # serializer warning when dumped via model_dump. The single-int form is
-    # intentional (DESIGN.md decision 5) so config_snapshot stays self-describing.
+    # intentional so config_snapshot stays self-describing.
     "ignore::UserWarning:pydantic.*",
 ]

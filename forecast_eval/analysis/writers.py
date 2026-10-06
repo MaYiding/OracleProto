@@ -53,7 +53,7 @@ _SUMMARY_FIELDS_V3: tuple[str, ...] = (
     "pass_any_at_n",
     "at_least_majority_at_n",
     "at_least_all_at_n",
-    "exam_score_at_n_avg",  # exam-score-metric: hook 1/2 (CSV header)
+    "exam_score_at_n_avg",
     "majority_vote_accuracy",
     "majority_vote_resolvable_rate",
     "parse_failure_rate",
@@ -420,7 +420,7 @@ def _write_per_model_summary_md(
         "pass@1", "FSS", "Cohen_κ",
         "Fleiss_κ", "H̄", "VCI", "MVG",
         "pass_any@N", "≥majority", "≥all",
-        "exam_score_at_n_avg",  # exam-score-metric: hook 2/2 (markdown table column)
+        "exam_score_at_n_avg",
         "majority_acc", "parse_fail", "error_rate",
         # Bail-out retry frequency. NULL on legacy DBs renders as "—".
         "retry_rate",

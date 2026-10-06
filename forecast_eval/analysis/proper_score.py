@@ -1,12 +1,12 @@
 """Proper scoring rules for the probabilistic family.
 
-Implements the formulas from `ANALYSIS_DESIGN_v4.md §4.1` / `specs/probabilistic-analysis/spec.md`:
+The probability scoring contracts are:
 
 * `brier_score_lab` / `brier_score_dec` — label-wise vs decision-wise Brier.
 * `nll` — log-loss with $\\epsilon$ clip; per-question dispatch on choice_type.
 * `mbs` — Metaculus Baseline Score (single-only; multi returns None).
 * `brier_index` — aggregate $100(1 - \\sqrt{\\overline{BS}})$, **mean THEN sqrt**.
-* `compute_abi` — adjusted Brier Index with the spec.md sign convention
+* `compute_abi` — adjusted Brier Index with the following sign convention
   ($\\overline{ABS} \\ge 0$ → $100(1-\\sqrt{\\cdot})$;
    $\\overline{ABS} < 0$ → $100(1+\\sqrt{|\\cdot|})$, model beats baseline).
 * `crowd_baseline_gamma_per_q` / `uniform_baseline_gamma_per_q` — per-question
@@ -127,7 +127,7 @@ def brier_index(per_question_bs: Iterable[float]) -> float | None:
 
 
 def compute_abi(per_question_abs: Iterable[float]) -> float | None:
-    """Adjusted Brier Index with the spec.md sign convention.
+    """Adjusted Brier Index with the following sign convention.
 
     $\\overline{ABS} = \\frac{1}{N}\\sum_q ABS_q$ where $ABS_q = BS_q - \\gamma_q$.
 

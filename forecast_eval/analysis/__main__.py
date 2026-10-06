@@ -14,7 +14,7 @@ from .scoring import CONTRACT
 def _cli(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Compute fixed Score and forecasting diagnostics.")
     parser.add_argument("run_dir", type=Path)
-    parser.add_argument("--profiles", nargs="+", help="Explicit manifest model IDs or catalog profile IDs to compare.")
+    parser.add_argument("--profiles", nargs="+", help="Explicit manifest model IDs to compare.")
     parser.add_argument("--allow-incomplete", action="store_true", help="Write coverage diagnostics; unavailable scores stay empty.")
     parser.add_argument("--bootstrap-iterations", type=int, default=CONTRACT["bootstrap_iterations"])
     parser.add_argument("--bootstrap-seed", type=int, default=CONTRACT["bootstrap_seed"])

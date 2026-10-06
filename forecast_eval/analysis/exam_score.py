@@ -1,4 +1,4 @@
-"""Exam-style partial credit — single-file, fully removable as a unit.
+"""Exam-style partial credit with a zero-false-positive gate.
 
 ## Formula
 
@@ -34,25 +34,11 @@ the arithmetic mean is taken at the end. Formally equivalent to
 | `hamming_score` | $1 - \\text{XOR-bits}/k$ | symmetric to FN | symmetric to FP | 0/1 |
 | **`exam_score` (this file)** | TP/|G|·1(FP=0) | veto | proportional deduction | 0/1 |
 
-`exam_score`'s selling point is "explainable in one sentence": any FP
-scores 0, otherwise it scores by the correct-answer proportion.
+Any false-positive selection scores zero; otherwise credit is the
+proportion of correct options selected.
 
-## Removal-equivalence constraint
-
-This file, `tests/test_exam_score.py`, the few hook points in `accuracy.py` /
-`writers.py` carrying grep-able comment markers, and the segments wrapped
-in HTML comments inside `README.md` / `DESIGN.md` / `FRAME.md` /
-`.env.example` together form a minimal closure that can be removed in one
-shot. After removal, the repository must return to a byte-identical state
-prior to this change (existing tests must all pass, existing CSV columns
-must be byte-identical, no residue in documentation segments). Marker
-literals are in `openspec/changes/add-exam-score-metric/design.md` §D8.
-
-Allowed dependency surface: standard library, `flatten.SampleRow`,
-`flatten._group_by_question`. SHALL NOT reverse-depend on `accuracy.py` /
-`proper_score.py` / `consistency.py` / `writers.py` / `inference.py` /
-`behavior.py` / `grid.py`; otherwise the minimal closure cannot be located
-during removal.
+The implementation depends only on the standard library and the sample-row
+helpers in `flatten.py`.
 """
 from __future__ import annotations
 

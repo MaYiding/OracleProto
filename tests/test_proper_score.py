@@ -1,6 +1,6 @@
 """Unit tests for `forecast_eval.analysis.proper_score`.
 
-These pin the exact mathematical contract from `specs/probabilistic-analysis/spec.md`:
+These pin the mathematical contracts:
 formulas (BS lab vs dec, BI mean-then-sqrt, NLL clip, MBS single-only) plus
 the ABI sign convention (negative ABS bumps ABI above 100).
 """

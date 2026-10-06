@@ -145,7 +145,7 @@ def test_tversky_score_empty_pred_returns_zero() -> None:
 
 def test_tversky_score_alpha_beta_asymmetry() -> None:
     """Default α=2 β=0.5: a single FP costs 0.4 from a 3-TP base, while a
-    single FN only costs 0.20 — exactly the 4× ratio in Decision 1."""
+    single FN only costs 0.20 — exactly the 4× false-positive to false-negative penalty ratio."""
     gt = frozenset({"A", "C", "F"})
     score_extra = tversky_score(frozenset({"A", "C", "F", "X"}), gt)  # 0.60
     score_miss = tversky_score(frozenset({"A", "C"}), gt)              # 0.80
@@ -156,7 +156,7 @@ def test_tversky_score_alpha_beta_asymmetry() -> None:
 
 
 def test_tversky_score_custom_alpha_beta() -> None:
-    """Verify (α, β) plumb through (Decision 12 sensitivity CLI relies on this)."""
+    """Verify (α, β) propagate through the sensitivity CLI."""
     gt = frozenset({"A", "B"})
     pred = frozenset({"A", "C"})  # TP=1, FP=1, FN=1
     # (α, β) = (1, 1) → Jaccard: 1 / (1 + 1 + 1) = 1/3

@@ -66,8 +66,6 @@ and stamps `bootstrap_seed`, `bootstrap_iterations`, `ci_alpha`,
 
 ## Tests
 
-`tests/test_panel_build.py` discovers any `panels/*.json` at runtime. Any
-evaluator-supplied manifest is preferred over `panels/example.json`; the
-example only acts as a fallback so the schema tests still exercise real
-JSON. If no manifest is found at all the tests skip rather than fail, so
-a fresh clone passes `pytest` without any local setup.
+`tests/test_panel_build.py` checks `panels/example.json` and creates temporary
+source runs for the database-copy and hash assertions. The tests require no
+personal panel manifests or collected runs.

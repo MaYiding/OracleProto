@@ -496,10 +496,6 @@ class Settings(BaseSettings):
     """Profiles whose pending slots stay in coverage but are not automatically dispatched."""
     COLLECTION_DRAIN_ON_ERROR: bool = False
     """Stop admitting samples after a fatal error while finishing samples already started."""
-    COLLECTION_EXPENSIVE_CONCURRENCY: int = Field(default=1, ge=1, le=20)
-    """Sample concurrency for expensive profiles in the collection dispatcher."""
-    COLLECTION_BATCH_SAMPLES: int = Field(default=60, ge=3, le=300)
-    """Maximum samples in a normal collection batch after the three-sample pilot."""
     COLLECTION_REFERENCE_DBS: dict[str, list[str]] = Field(default_factory=dict)
     """Read-only prior collection strata whose completed slots must not be repeated."""
 
@@ -507,13 +503,14 @@ class Settings(BaseSettings):
     SOURCE_DB: str = "./forecast_eval_set_example.db"
     # Question table inside SOURCE_DB. The bundled example DB ships with
     # `test_cases`; bring-your-own datasets can point at any other
-    # table name as long as it has the same 7-column schema (see FRAME.md §2.1).
+    # table name with columns id, choice_type, question_type, event, options,
+    # answer, and end_time.
     SOURCE_TABLE: str = "test_cases"
     PROMPT_TEMPLATE_STYLE: Literal["typed", "shared"] = "typed"
     """Dataset outer-template schema, retained verbatim for reproducible prompts."""
     # Every evaluation gets its own folder at RUNS_ROOT/{run_id}/, containing one
     # SQLite file per model under db/, plus analysis/ (post-run statistics) and
-    # logs/. The old single-file RESULTS_DB layout is gone — see FRAME.md §5/§6.
+    # logs/. Each model DB carries the questions and prompts needed for replay.
     RUNS_ROOT: str = "./runs"
     DB_COMMIT_BATCH: int = 10
     WRITE_MESSAGES_TRACE: bool = True
@@ -784,7 +781,7 @@ class Settings(BaseSettings):
         # MIN is a single int but C is a list. Hard error only when MIN exceeds
         # the smallest C in the grid (then no cell could honor the floor). When
         # MIN exceeds *some* but not all cells, the dispatcher silently clamps
-        # `effective_min = min(MIN, C)` per cell — see DESIGN.md decision 4.
+        # `effective_min = min(MIN, C)` per cell keeps the minimum within its budget.
         if self.REACT_MAX_SEARCH_CALLS and self.REACT_MIN_SEARCH_CALLS > min(self.REACT_MAX_SEARCH_CALLS):
             raise ValueError(
                 "REACT_MIN_SEARCH_CALLS must not exceed min(REACT_MAX_SEARCH_CALLS) "

@@ -1,4 +1,4 @@
-"""Tests for `scripts/fss_sensitivity.py` (v5 Decision 12 / task 4b.5).
+"""Tests for `scripts/fss_sensitivity.py`.
 
 Pins:
 * CLI accepts `--all` and `--alpha A --beta B` modes.

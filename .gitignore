@@ -85,10 +85,6 @@ Thumbs.db
 # Local databases and logs
 logs/
 runs/
-# `runs/` already covers everything below, but spell out the matplotlib figs
-# subdir explicitly per probabilistic-analysis-v4 task 29.3 — makes intent
-# obvious to future readers and tools that grep for fig artefacts.
-runs/*/analysis/figs/
 results.db
 results.db-*
 *.db-wal

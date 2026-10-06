@@ -3,7 +3,7 @@
 Re-aggregates the per-virtual-slug analysis output produced by the main
 flow into a triplet-keyed view that paper figures can consume directly.
 
-Layered design — DESIGN.md decision D7:
+The grid report uses these operations:
 
 * `build_grid_summary` walks every virtual slug, decodes the
   `(real_model, R, C)` triplet via `db.parse_virtual_slug`, and bundles
@@ -14,8 +14,7 @@ Layered design — DESIGN.md decision D7:
 * `pareto_frontier` returns the non-dominated cell set for paper Fig 1.
 * `paired_bootstrap_per_cell` runs single-variable bootstrap on per-
   question Brier scores via `inference.paired_bootstrap` (paired with a
-  zero array — D8 says "reuse paired_bootstrap, no new statistical
-  code") and reports the resulting BI 95% CI per slug.
+  zero array) and reports the resulting BI 95% CI per slug.
 * `winrate_matrix` counts (R, C) cells where real_model_a beats
   real_model_b in BI plus the subset that's statistically significant.
 * `run_grid_analysis` is the entry point called from
@@ -248,8 +247,7 @@ def build_grid_summary(
         # crowd would need to span virtual slugs, which doesn't make
         # sense), so abi_crowd / abi_uniform are computed inside
         # `proper_score.aggregate_probabilistic` from per-question scores
-        # alone (uniform γ from `obs`). This matches DESIGN.md's "grid
-        # cells are independent — no cross-cell crowd."
+        # alone (uniform γ from `obs`). Grid cells remain independent.
         rows = rows_by_model.get(slug, [])
         prob_agg = _grid_cell_probabilistic_aggregate(rows)
 

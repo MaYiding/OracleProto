@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import AnalysisContractError, AnalysisIncompleteError
-from .score_inputs import canonical_hash, load_catalog, load_model, local_path
+from .score_inputs import canonical_hash, load_model, local_path
 from .scoring import CONTRACT, POINTS, credit, question_metrics, score_intervals, selection_diagnostics, summarize
 
 
@@ -47,19 +47,15 @@ def run_analysis(
     if (not isinstance(bootstrap_iterations, int) or isinstance(bootstrap_iterations, bool)
             or bootstrap_iterations < 0 or 0 < bootstrap_iterations < 200):
         raise AnalysisContractError("Use zero bootstrap iterations or at least 200")
-    is_catalog = run_dir.is_file()
-    input_path = run_dir if is_catalog else local_path(run_dir / "manifest.json")
+    if not run_dir.is_dir():
+        raise AnalysisContractError("Scoring requires a run directory containing manifest.json")
+    input_path = local_path(run_dir / "manifest.json")
     manifest_text = input_path.read_text(encoding="utf-8")
     manifest = json.loads(manifest_text)
-    if is_catalog:
-        data = load_catalog(input_path, manifest, profiles)
-        models = sorted(data)
-        run_dir = input_path.parent
-    else:
-        models = sorted(manifest["models"] if profiles is None else profiles)
-        if set(models) - set(manifest["models"]):
-            raise AnalysisContractError("Requested profiles are absent from the manifest")
-        data = {m: load_model(run_dir, manifest, m) for m in models}
+    models = sorted(manifest["models"] if profiles is None else profiles)
+    if set(models) - set(manifest["models"]):
+        raise AnalysisContractError("Requested profiles are absent from the manifest")
+    data = {m: load_model(run_dir, manifest, m) for m in models}
     if not models or len(models) != len(set(models)):
         raise AnalysisContractError("A panel requires a nonempty list of distinct models")
     if len({d["sampling_n"] for d in data.values()}) != 1:
@@ -161,8 +157,7 @@ def run_analysis(
         "contract": contract, "contract_sha256": canonical_hash(contract),
         "implementation_sha256": canonical_hash(implementation), "implementation_files": implementation,
         "source_manifest_sha256": hashlib.sha256(manifest_text.encode()).hexdigest(),
-        "input_kind": "catalog" if is_catalog else "run_manifest",
-        "catalog_inputs": {key: manifest[key] for key in ("source_db", "source_sha256", "observations_path", "observations_sha256")} if is_catalog else None,
+        "input_kind": "run_manifest",
         "models": models, "common_question_ids": common, "common_question_ids_sha256": canonical_hash(common),
         "sampling_n": sampling_n, "sources": {m: data[m]["sources"] for m in models},
         "type_question_counts": dict(Counter(q["bucket"] for q in common_metrics[models[0]])),

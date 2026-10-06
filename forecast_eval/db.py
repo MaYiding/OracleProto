@@ -638,7 +638,7 @@ def register_run_meta(
     `finished_at` and `started_at` are preserved on resume so the original
     start timestamp survives. `reflection_protocol_text` / `..._hash` and
     `belief_protocol_text` / `..._hash` are independent of
-    `prompt_templates_hash` (DESIGN.md decision 2 + v4 belief decision).
+    `prompt_templates_hash`.
 
     `grid_origin`, when provided, is injected into the persisted
     `config_snapshot` JSON under the top-level key `grid_origin`. The

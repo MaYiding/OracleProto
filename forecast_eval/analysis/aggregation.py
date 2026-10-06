@@ -1,8 +1,7 @@
 """K-trial aggregators for the probabilistic family.
 
 Three aggregators take the per-question $K$-sample probability vectors and
-return a single aggregated probability vector. From `ANALYSIS_DESIGN_v4.md
-§3.2` / `specs/probabilistic-analysis/spec.md`:
+return a single aggregated probability vector:
 
 * `arithmetic_mean` — default; per-element average.
 * `logit_space_mean` — paper §C.9 default. For `single` choice_type:

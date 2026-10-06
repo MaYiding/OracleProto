@@ -8,7 +8,7 @@ sixth layer: every result item is sent through an independent detector LLM that
 returns ``keep`` / ``drop`` per item. Items the detector flags ``drop`` are
 removed before the main LLM ever sees the search payload.
 
-Key invariants enforced here (see ``specs/search-leak-filter/spec.md``):
+Key invariants enforced here:
 
 * The detector is invoked with a strict input field whitelist
   ``(title, url, published_date, content, raw_content, cutoff_date)``. The

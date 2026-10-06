@@ -2,7 +2,6 @@
 import asyncio
 import json
 from dataclasses import replace
-from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -20,8 +19,6 @@ from tests.test_leak_filter import _envelope, _scripted_client, _capturing_clien
 from tests.test_llm_no_browsing import _success_body
 from tests.test_react import _ScriptedLLM, _yes_no_question, _tool_msg, _final_msg
 from forecast_eval.types import QFilter
-from scripts.catalog_collection import sample_coverage
-from scripts import collect_forecast_panel
 
 
 def settings(**kwargs):
@@ -31,74 +28,6 @@ def settings(**kwargs):
         "MODEL_PROFILES": {"test-arm": {"model": "provider-model", "reasoning_effort": "high"}},
         "ENABLE_SEARCH_LEAK_FILTER": False, **kwargs,
     })
-
-
-def test_collection_plan_keeps_continuation_and_orders_twelve_reasoning_arms(tmp_path, monkeypatch):
-    selected = [
-        "gpt-5.4--reasoning-none", "gpt-5.4--reasoning-low",
-        "gpt-5.4--reasoning-medium", "gpt-5.4--reasoning-high",
-        "claude-opus-4-6--reasoning-low", "claude-opus-4-6--reasoning-medium",
-        "claude-opus-4-6--reasoning-high", "gpt-5.3-codex--reasoning-xhigh",
-        "claude-sonnet-4-6--reasoning-xhigh", "gemini-3.1-pro-preview-customtools--reasoning-high",
-        "glm-5--reasoning-high", "alicloud-kimi-k2.5--reasoning-high",
-    ]
-    continuation = {model + "--provider-default": {"model": model}
-                    for model in collect_forecast_panel.PRIORITY}
-    candidates = collect_forecast_panel.profile_candidates()
-    assert list(candidates) == selected
-    profiles = {**continuation, **candidates}
-    runtime = {"MODELS": list(profiles), "MODEL_PROFILES": profiles, "SAMPLING_N": 3,
-               "MODEL_QUESTION_IDS": {name: list(range(220)) for name in continuation},
-               "MODEL_TRAINING_CUTOFFS": {name: "2020-01-01" for name in profiles}}
-    monkeypatch.setattr(collect_forecast_panel, "COLLECTION", tmp_path)
-    monkeypatch.setattr(collect_forecast_panel, "PLAN", tmp_path / "plan.json")
-    monkeypatch.setattr(collect_forecast_panel, "local", lambda path: path)
-    run_ids = iter(["continuation-run", "reasoning-run"])
-    monkeypatch.setattr(collect_forecast_panel.runner, "generate_run_id", lambda: next(run_ids))
-    collect_forecast_panel.prepare_batches({"runtime": runtime, "source_sha256": "source", "reference_lineage": {}})
-    first = json.loads((tmp_path / "continuation.json").read_text())
-    second = json.loads((tmp_path / "reasoning.json").read_text())
-    assert first["runtime"]["MODELS"] == list(continuation)
-    assert first["runtime"]["MODEL_PROFILES"] == continuation
-    assert first["runtime"]["MODEL_QUESTION_IDS"] == runtime["MODEL_QUESTION_IDS"]
-    assert (first["new_sample_count"], first["search_call_ceiling"]) == (9240, 36960)
-    assert second["runtime"]["MODELS"] == selected
-    assert second["runtime"]["MODEL_QUESTION_IDS"] == {}
-    assert (second["new_sample_count"], second["search_call_ceiling"]) == (10800, 43200)
-    assert second["status"] == "awaiting_additional_quota"
-    for name in selected:
-        assert collect_forecast_panel.sample_target(second["runtime"], name) == 900
-        assert second["runtime"]["MODEL_PROFILES"][name]["reasoning_effort"] == name.rsplit("-", 1)[1]
-
-
-def test_collection_coverage_counts_only_requested_slots_and_resolved_repairs():
-    successes = {("arm", "anchor", 0): "repair", ("arm", "anchor", 1): "reference",
-                 ("arm", "added", 0): "collected"}
-    failures = {("arm", "anchor", 0): {"unknown"}, ("arm", "added", 1): {"network"}}
-    runtime = {"MODELS": ["arm"], "SAMPLING_N": 2, "MODEL_QUESTION_IDS": {"arm": ["added"]}}
-    plan = {"phase": "continuation", "runtime": runtime, "new_sample_count": 2}
-    coverage = sample_coverage(plan, {"anchor", "added"}, successes, failures)
-    assert (coverage["collected"], coverage["failed"], coverage["missing"], coverage["complete"]) == (1, 1, 0, False)
-    assert coverage["profiles"]["arm"]["pending_slots"] == [
-        {"question_id": "added", "sample_idx": 1, "state": "failed", "errors": ["network"]}]
-    repair = {"phase": "repair", "new_sample_count": 1,
-              "runtime": {**runtime, "MODEL_QUESTION_IDS": {"arm": ["anchor"]},
-                          "MODEL_SAMPLE_INDICES": {"arm": {"anchor": [0]}}}}
-    coverage = sample_coverage(repair, {"anchor", "added"}, successes, failures)
-    assert coverage["complete"] and coverage["collected"] == 1 and coverage["failed"] == 0
-    with pytest.raises(ValueError, match="sample count"):
-        sample_coverage({**plan, "new_sample_count": 4}, {"anchor", "added"}, successes, failures)
-    coverage = sample_coverage(plan, {"anchor", "added"}, {}, {})
-    assert coverage["missing"] == 2 and not coverage["complete"]
-
-
-async def test_collection_stops_before_billable_calls_when_disk_reserve_is_reached(monkeypatch):
-    plan = {"phase": "continuation", "runtime": {"MODELS": ["arm"], "SAMPLING_N": 3,
-                                                 "MODEL_QUESTION_IDS": {"arm": ["question"]}}}
-    monkeypatch.setattr(collect_forecast_panel, "status", lambda _: {"profiles": {"arm": {"completed": 0}}})
-    monkeypatch.setattr(collect_forecast_panel.shutil, "disk_usage", lambda _: SimpleNamespace(free=1024**3))
-    with pytest.raises(CollectionBlockedError, match="disk space"):
-        await collect_forecast_panel.dispatch_batches(plan, {})
 
 
 async def test_cancelled_search_keeps_request_identity_without_a_fabricated_response(tmp_path):
@@ -566,211 +495,6 @@ def test_refusal_retention_requires_evidence_and_does_not_change_sample_inferenc
         settings(COLLECTION_RETAIN_MODEL_REFUSALS=True, WRITE_REQUEST_AUDIT=False)
 
 
-def test_coverage_separates_retained_refusals_from_predictions_and_pending_failures():
-    runtime = {"MODELS": ["arm"], "SAMPLING_N": 2, "MODEL_QUESTION_IDS": {"arm": ["q"]},
-               "COLLECTION_RETAIN_MODEL_REFUSALS": True}
-    plan = {"phase": "continuation", "runtime": runtime, "new_sample_count": 2}
-    failures = {("arm", "q", 0): {"content_policy"}}
-    coverage = sample_coverage(plan, {"q"}, {("arm", "q", 1): "source"}, failures)
-    assert coverage["refused"] == 1 and coverage["collected"] == 1
-    assert coverage["attempts_complete"] and not coverage["complete"]
-    assert coverage["profiles"]["arm"]["pending_slots"] == []
-    assert coverage["profiles"]["arm"]["refused_slots"] == [
-        {"question_id": "q", "sample_idx": 0, "state": "refused", "errors": ["content_policy"]}]
-    failures[("arm", "q", 1)] = {"network"}
-    coverage = sample_coverage(plan, {"q"}, {}, failures)
-    assert coverage["failed"] == 1 and coverage["refused"] == 1 and not coverage["attempts_complete"]
-    runtime["COLLECTION_RETAIN_MODEL_REFUSALS"] = False
-    coverage = sample_coverage(plan, {"q"}, {}, failures)
-    assert coverage["failed"] == 2 and coverage["refused"] == 0
-
-
-async def test_batch_dispatch_finishes_with_refusals_without_repeating_calls(monkeypatch):
-    plan = {"phase": "continuation", "runtime": {"MODELS": ["arm"], "SAMPLING_N": 3,
-            "MODEL_QUESTION_IDS": {"arm": ["q"]}, "COLLECTION_RETAIN_MODEL_REFUSALS": True}}
-    monkeypatch.setattr(collect_forecast_panel, "status", lambda _: {
-        "profiles": {"arm": {"completed": 2, "refusals": 1}}, "refusals": 1})
-    saved = []
-    monkeypatch.setattr(collect_forecast_panel, "write_json", lambda path, value: saved.append(dict(value)))
-    assert await collect_forecast_panel.dispatch_batches(plan, {}) == 0
-    assert saved[-1]["status"] == "complete_with_refusals" and saved[-1]["model_refusals"] == 1
-
-
-async def test_batch_dispatch_counts_a_refusal_as_progress_without_counting_a_prediction(tmp_path, monkeypatch):
-    runtime = settings(SAMPLING_N=1, COLLECTION_RETAIN_MODEL_REFUSALS=True,
-                       MODEL_QUESTION_IDS={"test-arm": ["q"]}).model_dump()
-    runtime.pop("LEAK_DETECTOR_API_KEY")
-    plan = {"phase": "continuation", "run_id": "fixture", "runtime": runtime}
-    calls = []
-    def counts(_):
-        return {"profiles": {"test-arm": {"completed": 0, "refusals": len(calls)}}, "refusals": len(calls)}
-    async def quota(*args):
-        return 1000
-    async def evaluate(config, *args, **kwargs):
-        assert config.COLLECTION_RETAIN_MODEL_REFUSALS and config.COLLECTION_SAMPLE_LIMIT == 1
-        assert kwargs["skip_analysis"] is True
-        calls.append(config.COLLECTION_MODEL)
-        return 0
-    monkeypatch.setattr(collect_forecast_panel, "status", counts)
-    monkeypatch.setattr(collect_forecast_panel, "available_searches", quota)
-    monkeypatch.setattr(collect_forecast_panel.evaluation, "_run_async", evaluate)
-    monkeypatch.setattr(collect_forecast_panel.shutil, "disk_usage", lambda _: SimpleNamespace(free=20 * 1024**3))
-    monkeypatch.setattr(collect_forecast_panel, "write_json", lambda *args: None)
-    monkeypatch.setattr(collect_forecast_panel, "COLLECTION", tmp_path)
-    monkeypatch.setattr(collect_forecast_panel, "record_dispatch", lambda *args, **kwargs: None)
-    monkeypatch.setattr(collect_forecast_panel, "local", lambda path: path)
-    assert await collect_forecast_panel.dispatch_batches(plan, {"LLM_API_KEY": "sk-fixture"}) == 0
-    assert calls == ["test-arm"] and plan["status"] == "complete_with_refusals"
-    assert counts(plan)["profiles"]["test-arm"]["completed"] == 0
-
-
-@pytest.mark.parametrize("costly,stop_after_first", [(False, False), (True, False), (False, True)])
-async def test_dispatch_tuning_is_applied_between_batches_and_stop_drains(tmp_path, monkeypatch, costly, stop_after_first):
-    runtime = settings(SAMPLING_N=3, MODEL_QUESTION_IDS={"test-arm": ["q1", "q2"]},
-                       MODEL_PROFILES={"test-arm": {"model": "gpt-5.4" if costly else "qwen3.5-plus"}}).model_dump()
-    runtime.pop("LEAK_DETECTOR_API_KEY")
-    plan = {"phase": "continuation", "run_id": "fixture", "runtime": runtime}
-    monkeypatch.setattr(collect_forecast_panel, "ROOT", tmp_path)
-    monkeypatch.setattr(collect_forecast_panel, "COLLECTION", tmp_path)
-    monkeypatch.setattr(collect_forecast_panel, "local", lambda path: path)
-    (tmp_path / "runs/fixture").mkdir(parents=True)
-    control = tmp_path / "dispatch_control.json"
-    control.write_text(json.dumps({"LEAK_DETECTOR_CONCURRENCY": 10, "LLM_MAX_CONCURRENCY": 8,
-                                   "COLLECTION_EXPENSIVE_CONCURRENCY": 2}))
-    completed = 0
-    stop = asyncio.Event()
-    configs = []
-    async def quota(*args):
-        return 1000
-    async def evaluate(config, *args, **kwargs):
-        nonlocal completed
-        assert kwargs["skip_analysis"] is True
-        configs.append(config)
-        completed += config.COLLECTION_SAMPLE_LIMIT
-        control.write_text(json.dumps({"LEAK_DETECTOR_CONCURRENCY": 15, "LLM_MAX_CONCURRENCY": 10,
-                                       "COLLECTION_EXPENSIVE_CONCURRENCY": 3}))
-        if stop_after_first:
-            stop.set()
-        return 0
-    monkeypatch.setattr(collect_forecast_panel, "status", lambda _: {
-        "profiles": {"test-arm": {"completed": completed, "refusals": 0}}, "refusals": 0})
-    monkeypatch.setattr(collect_forecast_panel, "available_searches", quota)
-    monkeypatch.setattr(collect_forecast_panel.evaluation, "_run_async", evaluate)
-    monkeypatch.setattr(collect_forecast_panel.shutil, "disk_usage", lambda _: SimpleNamespace(free=20 * 1024**3))
-    assert await collect_forecast_panel.dispatch_batches(plan, {"LLM_API_KEY": "sk-fixture-private"}, stop) == 0
-    assert completed == (3 if stop_after_first else 6)
-    assert [cfg.LEAK_DETECTOR_CONCURRENCY for cfg in configs] == ([10] if stop_after_first else [10, 15])
-    assert [cfg.LLM_MAX_CONCURRENCY for cfg in configs] == ([2, 3] if costly else [8, 10])[:len(configs)]
-    expected_contract = db.collection_contract(runtime)
-    assert all(db.collection_contract(db.snapshot_settings(cfg)) == expected_contract for cfg in configs)
-    assert plan["status"] == ("stopped_at_batch_boundary" if stop_after_first else "complete")
-    text = (tmp_path / "runs/fixture/dispatches.jsonl").read_text()
-    assert "sk-fixture-private" not in text and "tvly-collection-secret" not in text
-    journal = [json.loads(line) for line in text.splitlines()]
-    assert [entry["event"] for entry in journal] == (
-        ["start", "finish", "stopped_at_batch_boundary"] if stop_after_first else ["start", "finish", "start", "finish"])
-    assert journal[0]["config_snapshot"]["LEAK_DETECTOR_CONCURRENCY"] == 10
-    assert journal[1]["counts"]["completed"] == 3
-
-
-@pytest.mark.parametrize("control", [{"LLM_MAX_TOKENS": 100}, {"LEAK_DETECTOR_CONCURRENCY": 0},
-    {"LLM_MAX_CONCURRENCY": True}, {"LLM_MAX_CONCURRENCY": 21},
-    {"COLLECTION_BATCH_SAMPLES": 2}, {"COLLECTION_BATCH_SAMPLES": 301},
-    {"COLLECTION_BATCH_SAMPLES": True}, []])
-def test_dispatch_tuning_rejects_contract_fields_and_invalid_limits(tmp_path, monkeypatch, control):
-    monkeypatch.setattr(collect_forecast_panel, "COLLECTION", tmp_path)
-    monkeypatch.setattr(collect_forecast_panel, "local", lambda path: path)
-    (tmp_path / "dispatch_control.json").write_text(json.dumps(control))
-    with pytest.raises(CollectionBlockedError, match="concurrency"):
-        collect_forecast_panel.dispatch_settings({"runtime": {}}, {})
-
-
-async def test_delegated_profiles_leave_local_queue_without_becoming_complete(tmp_path, monkeypatch):
-    monkeypatch.setattr(collect_forecast_panel, "COLLECTION", tmp_path)
-    monkeypatch.setattr(collect_forecast_panel, "local", lambda path: path)
-    plan = {"phase": "continuation", "run_id": "fixture", "runtime": {"MODELS": ["arm"],
-            "SAMPLING_N": 3, "MODEL_QUESTION_IDS": {"arm": ["q"]}}}
-    (tmp_path / "local_queue_exclusions.json").write_text(json.dumps({"run_id": "fixture", "profiles": ["arm"]}))
-    monkeypatch.setattr(collect_forecast_panel, "status", lambda _: {
-        "profiles": {"arm": {"completed": 0, "refusals": 0}}, "refusals": 0})
-    async def forbidden(*args):
-        raise AssertionError("delegated profile must not issue paid requests")
-    monkeypatch.setattr(collect_forecast_panel, "available_searches", forbidden)
-    monkeypatch.setattr(collect_forecast_panel.evaluation, "_run_async", forbidden)
-    assert await collect_forecast_panel.dispatch_batches(plan, {}) == 0
-    assert plan["status"] == "local_queue_complete_pending_delegation"
-    assert collect_forecast_panel.excluded_profiles({**plan, "run_id": "another-run"}) == set()
-    (tmp_path / "local_queue_exclusions.json").write_text(json.dumps({"run_id": "fixture", "profiles": ["unknown"]}))
-    with pytest.raises(CollectionBlockedError, match="unknown profile"):
-        collect_forecast_panel.excluded_profiles(plan)
-
-
-def test_run_local_exclusions_preserve_other_run_queue(tmp_path, monkeypatch):
-    monkeypatch.setattr(collect_forecast_panel, "ROOT", tmp_path)
-    monkeypatch.setattr(collect_forecast_panel, "COLLECTION", tmp_path)
-    monkeypatch.setattr(collect_forecast_panel, "local", lambda path: path)
-    shared = tmp_path / "local_queue_exclusions.json"
-    shared.write_text(json.dumps({"run_id": "first", "profiles": ["external"]}))
-    run_dir = tmp_path / "runs/second"
-    run_dir.mkdir(parents=True)
-    run_path = run_dir / "local_queue_exclusions.json"
-    run_path.write_text(json.dumps({"run_id": "second", "profiles": ["deferred"]}))
-    first = {"run_id": "first", "runtime": {"MODELS": ["external", "local"]}}
-    second = {"run_id": "second", "runtime": {"MODELS": ["glm", "kimi", "deferred"]}}
-    assert collect_forecast_panel.excluded_profiles(first) == {"external"}
-    assert collect_forecast_panel.excluded_profiles(second) == {"deferred"}
-    assert second["runtime"]["MODELS"] == ["glm", "kimi", "deferred"]
-    shared.write_text(json.dumps({"run_id": "second", "profiles": ["glm"]}))
-    assert collect_forecast_panel.excluded_profiles(second) == {"glm", "deferred"}
-    run_path.write_text(json.dumps({"run_id": "first", "profiles": ["deferred"]}))
-    with pytest.raises(CollectionBlockedError, match="mismatched run ID"):
-        collect_forecast_panel.excluded_profiles(second)
-    run_path.write_text(json.dumps({"run_id": "second", "profiles": ["unknown"]}))
-    with pytest.raises(CollectionBlockedError, match="unknown profile"):
-        collect_forecast_panel.excluded_profiles(second)
-
-
-def test_dispatch_engineering_settings_preserve_inference_hash():
-    default = settings()
-    tuned = settings(COLLECTION_DRAIN_ON_ERROR=True, COLLECTION_EXPENSIVE_CONCURRENCY=2,
-                     LLM_MAX_CONCURRENCY=12, LEAK_DETECTOR_CONCURRENCY=20, COLLECTION_BATCH_SAMPLES=120)
-    assert default.COLLECTION_EXPENSIVE_CONCURRENCY == 1
-    assert db.compute_collection_contract_hash(db.snapshot_settings(default)) == db.compute_collection_contract_hash(db.snapshot_settings(tuned))
-    assert db.snapshot_settings(tuned)["COLLECTION_DRAIN_ON_ERROR"] is True
-
-
-@pytest.mark.parametrize("costly,done,quota_left,expected", [(False, 0, 1000, 3),
-    (False, 3, 1000, 120), (False, 3, 160, 15), (False, 597, 1000, 3), (True, 3, 1000, 15)])
-async def test_batch_size_preserves_pilot_quota_scope_and_expensive_limits(tmp_path, monkeypatch, costly, done, quota_left, expected):
-    runtime = settings(SAMPLING_N=3, MODEL_QUESTION_IDS={"test-arm": [f"q{i}" for i in range(200)]},
-        MODEL_PROFILES={"test-arm": {"model": "gpt-5.4" if costly else "glm-5"}}).model_dump()
-    runtime.pop("LEAK_DETECTOR_API_KEY")
-    monkeypatch.setattr(collect_forecast_panel, "ROOT", tmp_path)
-    monkeypatch.setattr(collect_forecast_panel, "COLLECTION", tmp_path)
-    monkeypatch.setattr(collect_forecast_panel, "local", lambda path: path)
-    (tmp_path / "runs/fixture").mkdir(parents=True)
-    (tmp_path / "dispatch_control.json").write_text(json.dumps({"COLLECTION_BATCH_SAMPLES": 120, "LLM_MAX_CONCURRENCY": 16}))
-    plan = {"phase": "continuation", "run_id": "fixture", "runtime": runtime}
-    stop = asyncio.Event()
-    async def quota(*args):
-        return quota_left
-    async def evaluate(config, *args, **kwargs):
-        nonlocal done
-        assert config.COLLECTION_SAMPLE_LIMIT == expected and config.SAMPLING_N == 3
-        assert config.LLM_MAX_CONCURRENCY == (1 if costly else 16)
-        assert db.collection_contract(db.snapshot_settings(config)) == db.collection_contract(runtime)
-        assert kwargs["skip_analysis"] is True
-        done += expected
-        stop.set()
-        return 0
-    monkeypatch.setattr(collect_forecast_panel, "available_searches", quota)
-    monkeypatch.setattr(collect_forecast_panel.evaluation, "_run_async", evaluate)
-    monkeypatch.setattr(collect_forecast_panel, "status", lambda _: {"profiles": {"test-arm": {"completed": done, "refusals": 0}}, "refusals": 0})
-    monkeypatch.setattr(collect_forecast_panel.shutil, "disk_usage", lambda _: SimpleNamespace(free=20 * 1024**3))
-    assert await collect_forecast_panel.dispatch_batches(plan, {"LLM_API_KEY": "sk-fixture"}, stop) == 0
-    assert plan["status"] == "stopped_at_batch_boundary"
-
-
 @pytest.mark.parametrize("failure", ["row", "auth", "retrieval"])
 async def test_collection_failure_drains_started_samples_without_admitting_pending(tmp_path, monkeypatch, failure):
     config = settings(SAMPLING_N=3, LLM_MAX_CONCURRENCY=2, COLLECTION_DRAIN_ON_ERROR=True,
@@ -841,81 +565,6 @@ async def test_collection_failure_drains_started_samples_without_admitting_pendi
     conn.close()
 
 
-async def test_quota_refresh_retries_only_the_failed_key_and_uses_start_time(monkeypatch):
-    delays, saved, called = [], [], []
-    async def sleep(delay):
-        delays.append(float(delay))
-    times = iter(["2026-09-30T23:59:00+00:00", "2026-10-01T00:01:00+00:00"])
-    monkeypatch.setattr(collect_forecast_panel.asyncio, "sleep", sleep)
-    monkeypatch.setattr(collect_forecast_panel.db, "utcnow_iso", lambda: next(times))
-    monkeypatch.setattr(collect_forecast_panel, "write_json", lambda path, value: saved.append(value))
-    replies = iter([
-        httpx.Response(200, json={"account": {"plan_limit": 1000, "plan_usage": 200}, "key": {"limit": None}}),
-        httpx.Response(429, headers={"Retry-After": "7"}),
-        httpx.Response(503),
-        httpx.Response(200, json={"account": {"plan_limit": 1000, "plan_usage": 100}, "key": {"limit": 500, "usage": 100}}),
-        httpx.Response(401),
-    ])
-    def respond(request):
-        called.append(request.headers["Authorization"])
-        return next(replies)
-    with respx.mock() as router:
-        router.get("https://api.tavily.com/usage").mock(side_effect=respond)
-        assert await collect_forecast_panel.query_search_quota(["key-a", "key-b", "key-c", "key-a"]) == 1200
-    assert called == ["Bearer key-a", "Bearer key-b", "Bearer key-b", "Bearer key-b", "Bearer key-c"]
-    assert delays == [7, 60]
-    assert len(saved) == 1
-    assert saved[0]["checked_at"] == "2026-09-30T23:59:00+00:00"
-    assert saved[0]["finished_at"] == "2026-10-01T00:01:00+00:00"
-    assert [key["remaining"] for key in saved[0]["keys"]] == [800, 400, 0]
-    assert all(key not in json.dumps(saved) for key in ["key-a", "key-b", "key-c"])
-
-
-async def test_quota_retry_exhaustion_preserves_snapshot_and_stops_other_queries(monkeypatch):
-    delays, called = [], []
-    async def sleep(delay):
-        delays.append(float(delay))
-    monkeypatch.setattr(collect_forecast_panel.asyncio, "sleep", sleep)
-    monkeypatch.setattr(collect_forecast_panel, "write_json", lambda *args: pytest.fail("incomplete quota must not replace snapshot"))
-    def respond(request):
-        key = request.headers["Authorization"]
-        called.append(key)
-        if key == "Bearer key-a":
-            return httpx.Response(200, json={"account": {"plan_limit": 1000, "plan_usage": 200}})
-        return httpx.Response(429)
-    with respx.mock() as router:
-        router.get("https://api.tavily.com/usage").mock(side_effect=respond)
-        with pytest.raises(httpx.HTTPStatusError):
-            await collect_forecast_panel.query_search_quota(["key-a", "key-b", "key-c"])
-    assert called == ["Bearer key-a", "Bearer key-b", "Bearer key-b", "Bearer key-b"]
-    assert delays == [30, 60]
-
-
-async def test_quota_refresh_recovers_transport_timeout(monkeypatch):
-    delays, saved = [], []
-    async def sleep(delay):
-        delays.append(float(delay))
-    monkeypatch.setattr(collect_forecast_panel.asyncio, "sleep", sleep)
-    monkeypatch.setattr(collect_forecast_panel, "write_json", lambda path, value: saved.append(value))
-    with respx.mock() as router:
-        route = router.get("https://api.tavily.com/usage").mock(side_effect=[
-            httpx.ReadTimeout("usage endpoint"),
-            httpx.Response(200, json={"account": {"plan_limit": 1000, "plan_usage": 700}}),
-        ])
-        assert await collect_forecast_panel.query_search_quota(["key-a"]) == 300
-        assert route.call_count == 2
-    assert delays == [30] and len(saved) == 1
-
-
-async def test_quota_unknown_limit_cannot_replace_confirmed_snapshot(monkeypatch):
-    monkeypatch.setattr(collect_forecast_panel, "write_json", lambda *args: pytest.fail("unknown quota must not replace snapshot"))
-    with respx.mock() as router:
-        route = router.get("https://api.tavily.com/usage").respond(200, json={"account": {}})
-        with pytest.raises(CollectionBlockedError):
-            await collect_forecast_panel.query_search_quota(["key-a"])
-        assert route.call_count == 1
-
-
 @pytest.mark.parametrize("searches_before,error_count,fallback", [(0, 1, False), (4, 1, False), (0, 6, True)])
 @respx.mock
 async def test_generated_tool_error_consumes_round_and_preserves_http_failure(
@@ -973,37 +622,6 @@ async def test_generated_tool_error_consumes_round_and_preserves_http_failure(
     conn.close()
 
 
-@pytest.mark.parametrize("defer", [False, True])
-async def test_tool_failure_deferral_continues_other_slots_without_marking_success(tmp_path, monkeypatch, defer):
-    config = settings(SAMPLING_N=2, SCORE_ANSWERS=False, REQUIRE_HEALTHY_RETRIEVAL=True,
-        COLLECTION_DEFER_TOOL_FAILURES=defer, COLLECTION_DRAIN_ON_ERROR=True,
-        LLM_MAX_CONCURRENCY=1, DB_COMMIT_BATCH=1)
-    conn = db.connect(tmp_path / "deferred.db")
-    db.init_schema(conn, 2)
-    q = _yes_no_question()
-    conn.execute("INSERT INTO questions (id, choice_type, question_type, event, options, answer, end_time, imported_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (q.id, q.choice_type, q.question_type, q.event, q.options, q.answer, q.end_time, db.utcnow_iso()))
-    calls = []
-    async def generate(task, **kwargs):
-        calls.append(task.sample_idx)
-        return runner._error_row(task.question, task.sample_idx, "tool_use_failed" if task.sample_idx == 0 else None)
-    monkeypatch.setattr(runner, "_run_task_with_retry", generate)
-    stats = await runner.run(settings=config, filters=QFilter(), questions=[q], templates={}, run_id="r", conns={"test-arm": conn})
-    assert stats.aborted is not defer
-    assert stats.deferred == 1
-    assert calls == ([0, 1] if defer else [0])
-    assert (q.id, 0) not in db.load_completed_samples(conn, 2, retain_model_refusals=True)
-    assert db.load_deferred_tool_failures(conn, 2) == {(q.id, 0)}
-    if defer:
-        stats = await runner.run(settings=config, filters=QFilter(), questions=[q], templates={}, run_id="r", conns={"test-arm": conn})
-        assert calls == [0, 1] and stats.planned == 0 and stats.deferred == 1 and not stats.aborted
-        assert stats.completed_preexisting == 1
-        plan = {"phase": "fixture", "runtime": {"MODELS": ["test-arm"], "SAMPLING_N": 2}, "new_sample_count": 2}
-        coverage = sample_coverage(plan, {q.id}, {("test-arm", q.id, 1): "source"}, {("test-arm", q.id, 0): {"tool_use_failed"}})
-        assert not coverage["attempts_complete"] and coverage["failed"] == 1 and coverage["collected"] == 1
-    conn.close()
-
-
 def test_tool_failure_deferral_keeps_inference_hash_and_requires_audit():
     config = settings()
     deferred = settings(COLLECTION_DEFER_TOOL_FAILURES=True)
@@ -1043,15 +661,3 @@ def test_profile_pause_is_dispatch_only_and_validates_names():
     assert db.compute_collection_contract_hash(original)==db.compute_collection_contract_hash(paused)
     for names, reason in [(["other"],"declared in MODELS"),(["test-arm","test-arm"],"unique")]:
         with pytest.raises(ValueError,match=reason):settings(COLLECTION_PAUSED_PROFILES=names)
-
-
-async def test_batch_dispatch_pause_stays_incomplete(monkeypatch):
-    plan={"phase":"continuation","runtime":{"MODELS":["held","done"],"SAMPLING_N":3,
-        "MODEL_QUESTION_IDS":{"held":["q"],"done":["q"]},"COLLECTION_RETAIN_MODEL_REFUSALS":True,
-        "COLLECTION_PAUSED_PROFILES":["held"]}}
-    monkeypatch.setattr(collect_forecast_panel,"status",lambda _:{"profiles":{
-        "held":{"completed":1,"refusals":0},"done":{"completed":2,"refusals":1}},"refusals":1})
-    monkeypatch.setattr(collect_forecast_panel,"write_json",lambda *args:None)
-    monkeypatch.setattr(collect_forecast_panel.evaluation,"_run_async",lambda *args,**kwargs:pytest.fail("must not dispatch held profile"))
-    assert await collect_forecast_panel.dispatch_batches(plan,{})==0
-    assert plan["status"]=="pending_paused_profiles" and plan["paused_pending"]==2

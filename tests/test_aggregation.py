@@ -1,11 +1,9 @@
-"""Phase 2 task 19.6: aggregation.py unit tests.
+"""Unit tests for probability aggregation.
 
 Covers `arithmetic_mean`, `logit_space_mean`, `loo_shrinkage`,
-`majority_vote_v4_letter`, `majority_vote_accuracy_v4` against the
-scenarios in `specs/probabilistic-analysis/spec.md`.
+`majority_vote_v4_letter`, `majority_vote_accuracy_v4`.
 
-A note on the spec's "logit mean shrinks to 0.5 under divergent trials"
-scenario: the geometric-mean math (paper §C.9 formula) actually moves the
+The geometric-mean calculation moves the
 output AWAY from 0.5 when trials disagree asymmetrically (e.g. 2× (0.9,
 0.1) + 1× (0.1, 0.9)). We assert the unambiguous invariants — K=1 reduce,
 simplex preservation, trial-consistent equals arithmetic — and assert
@@ -235,7 +233,7 @@ def test_loo_shrinkage_validates_lengths():
 
 
 def test_loo_shrinkage_recovers_synthetic_alpha_star():
-    """Phase 2 task 22.1: inject α=0.5 prior, verify grid recovers α* near 0.5.
+    """Inject an α=0.5 prior and verify the grid recovers α* near 0.5.
 
     Construct: model is overconfident at strength α=1 (raw signal). Truth
     matches with probability 0.7. Optimal shrinkage on Brier is α<1.

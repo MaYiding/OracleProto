@@ -1,10 +1,10 @@
-"""Phase 2 task 21.7: inference.py unit tests.
+"""Unit tests for paired resampling and inference.
 
 Covers `paired_bootstrap`, `holm_bonferroni`, `difficulty_tertile`,
 `paired_bootstrap_by_difficulty`, `posterior_a_better_than_b`, and the
 `pairwise_paired_bootstrap` orchestrator.
 
-Spec scenarios verified:
+Contracts covered:
 * Paired bootstrap is paired, not independent (same indices for A and B).
 * Holm correction direction (multiply by remaining ranks descending).
 * B = 5000 default; same seed → reproducible.

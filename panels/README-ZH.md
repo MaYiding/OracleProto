@@ -66,7 +66,5 @@ build 脚本会把每条 `runs/<source_run_id>/db/<db_filename>` 复制（或软
 
 ## 测试
 
-`tests/test_panel_build.py` 在运行时发现 `panels/*.json` 的任意一份。任何由
-评测者提供的 manifest 优先于 `panels/example.json`；example 仅作 fallback，
-让 schema 测试始终对真实 JSON 跑一遍。若一份 manifest 都没找到，测试会 skip
-而非 fail，新 clone 跑 `pytest` 无需任何本地准备。
+`tests/test_panel_build.py` 检查 `panels/example.json`，并创建临时源运行来
+验证数据库复制与哈希。测试不需要个人面板清单或已采集的运行。

@@ -1,38 +1,4 @@
-"""Tests for `forecast_eval.analysis.exam_score`.
-
-## Removal verification checklist (manual checklist — execute once during review)
-
-This metric guarantees "removal equivalence": after deleting the files / sections
-below, all existing tests in the repo SHALL pass, and the CSV / Markdown produced
-by `python -m forecast_eval.analysis <run_dir>` **except for the
-`exam_score_at_n_avg` column** SHALL match the output before this change byte-for-byte.
-
-Concrete steps (copy these into a local worktree during review):
-
-1. In a temporary worktree, `git checkout` the parent commit of this PR (i.e. before
-   exam_score was introduced) and run `python -m pytest tests/ -x -q`, recording the pass count;
-2. Run `python -m forecast_eval.analysis runs/<some v5 run_dir>` and back up the generated
-   `per_model_summary.csv` / `per_model_summary.md`;
-3. Switch back to the PR branch and delete the following files / sections (the marker literal is
-   uniformly `exam-score-metric:`):
-   - `forecast_eval/analysis/exam_score.py`
-   - `tests/test_exam_score.py` (i.e. this file)
-   - In `forecast_eval/analysis/accuracy.py`, the 4 hookups listed by grep for this marker
-     (import / Aggregate field / as_ordered_dict / _aggregate injection)
-   - In `forecast_eval/analysis/writers.py`, the 2 hookups listed by grep for this marker
-     (CSV header / markdown header)
-   - The HTML-comment-wrapped sections in `README.md` / `DESIGN.md` / `FRAME.md`
-   - The marked SAMPLING_N "number of independent test runs" semantic comment expansion in `.env.example`
-4. Run `python -m pytest tests/ -x -q` -> MUST match the pass count in step 1 exactly (excluding
-   this file which has been deleted);
-5. Run `python -m forecast_eval.analysis runs/<same run_dir>` -> the generated CSV MUST be
-   byte-for-byte identical to the backup from step 2 when compared with `cmp`;
-6. Run `grep -rn` for this marker -> the main repo MUST return 0 hits (except internal
-   self-references in `openspec/changes/add-exam-score-metric/`, which migrate with the change
-   on archive).
-
-Any failing step breaks the "removal equivalence" constraint and the PR cannot be merged.
-"""
+"""Contracts for exam-style credit, exclusion rules, and question-level averaging."""
 from __future__ import annotations
 
 import json

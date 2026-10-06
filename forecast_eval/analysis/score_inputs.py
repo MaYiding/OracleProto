@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import hashlib
-import gzip
 import json
 import sqlite3
 from datetime import date
@@ -23,12 +22,7 @@ def canonical_hash(value: Any) -> str:
 
 
 def local_path(path: Path) -> Path:
-    resolved = path.resolve()
-    protected = ("/Users/mayiding/Library/Mobile Documents", "/Users/mayiding/Library/CloudStorage",
-                 "/Users/mayiding/Library/Application Support/CloudDocs")
-    if any(resolved.is_relative_to(Path(p)) for p in protected):
-        raise AnalysisContractError("Protected cloud paths cannot be analysis inputs or outputs")
-    return resolved
+    return path.expanduser().resolve()
 
 
 def _trial(model: str, q: dict, i: int, raw: dict, source: str | None) -> dict:
@@ -214,134 +208,3 @@ def load_model(run_dir: Path, manifest: dict, model: str) -> dict[str, Any]:
     return {"model": model, "sampling_n": k, "questions": normalized, "trials": observations,
             "sources": source_audit, "declared_questions": len(ids),
             "cutoff_questions": len(ids) - len(normalized)}
-
-
-def load_catalog(catalog_path: Path, catalog: dict, profiles: list[str] | None = None) -> dict[str, dict]:
-    """Consume the hashed, audited catalog export, including explicit profile aliases and repairs."""
-    catalog_path = local_path(catalog_path)
-    root = catalog_path.parent.parent.parent
-    declared = set(s["profile_id"] for s in catalog["sources"])
-    for phase in catalog["coverage"]:
-        declared.update(phase["profiles"])
-    models = sorted(declared if profiles is None else profiles)
-    if not models or len(models) != len(set(models)) or set(models) - declared:
-        raise AnalysisContractError("Select distinct profile IDs declared by the catalog")
-    ids = catalog["anchor_question_ids"] + catalog["additional_question_ids"]
-    if len(ids) != len(set(ids)):
-        raise AnalysisContractError("Catalog question IDs overlap")
-    ids = sorted(ids)
-    corpus = local_path(root / catalog["source_db"])
-    if not corpus.is_relative_to(root):
-        raise AnalysisContractError("Catalog corpus must remain inside the project")
-    with corpus.open("rb") as f:
-        if hashlib.file_digest(f, "sha256").hexdigest() != catalog["source_sha256"]:
-            raise AnalysisContractError("Catalog corpus hash differs")
-    conn = sqlite3.connect(corpus.as_uri() + "?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    try:
-        questions = {row["id"]: dict(row) for row in conn.execute(
-            "SELECT id,choice_type,question_type,event,options,answer,end_time FROM test_cases") if row["id"] in ids}
-    finally:
-        conn.close()
-    if set(ids) != questions.keys():
-        raise AnalysisContractError("Catalog corpus lacks declared questions")
-    sources = {}
-    for source in catalog["sources"]:
-        identity = source["source_id"]
-        if identity in sources and sources[identity] != source:
-            raise AnalysisContractError("A catalog source ID has conflicting metadata")
-        meta = source["metadata"]
-        base = (parse_virtual_slug(meta["model"]) or (meta["model"],))[0]
-        if source["profile_id"] != base and not (
-            source["cohort"] == "reference" and source["profile_id"] == base + "--provider-default"
-        ):
-            raise AnalysisContractError("Catalog profile alias does not match its source model")
-        if canonical_hash(collection_contract(json.loads(meta["config_snapshot"]))) != source["collection_contract_hash"]:
-            raise AnalysisContractError("Catalog collection contract hash differs")
-        sources[identity] = source
-    ks = {s["metadata"]["sampling_n"] for s in sources.values() if s["profile_id"] in models}
-    if len(ks) != 1 or not isinstance(next(iter(ks)), int) or next(iter(ks)) < 1:
-        raise AnalysisContractError("Catalog profiles require one declared repetition count")
-    k = ks.pop()
-    export = local_path(root / catalog["observations_path"])
-    if not export.is_relative_to(root):
-        raise AnalysisContractError("Catalog observations must remain inside the project")
-    with export.open("rb") as f:
-        if hashlib.file_digest(f, "sha256").hexdigest() != catalog["observations_sha256"]:
-            raise AnalysisContractError("Catalog observations hash differs")
-    if catalog.get("observations_encoding") != "gzip":
-        raise AnalysisContractError("Unsupported catalog observation encoding")
-    candidates: dict[tuple[str, str, int], list[tuple[str, dict]]] = {}
-    counts = {sid: 0 for sid in sources}
-    retained_fields = ("created_at", "error", "parse_ok", "final_answer_letters", "final_answer_raw",
-                       "tool_calls_count", "react_steps", "latency_ms", "prompt_tokens",
-                       "completion_tokens", "reasoning_tokens")
-    with gzip.open(export, "rt", encoding="utf-8") as f:
-        for line in f:
-            record = json.loads(line)
-            sid = record["source_id"]
-            if sid not in sources or record["profile_id"] != sources[sid]["profile_id"]:
-                raise AnalysisContractError("Observation source identity differs from catalog")
-            if record["cohort"] != sources[sid]["cohort"] or record["question_id"] not in questions:
-                raise AnalysisContractError("Observation cohort or question differs from catalog")
-            index = record["sample_idx"]
-            if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < sources[sid]["metadata"]["sampling_n"]:
-                raise AnalysisContractError("Observation trial index is outside the declared range")
-            counts[sid] += 1
-            if record["profile_id"] not in models:
-                continue
-            if not record["result"].get("created_at"):
-                raise AnalysisContractError("An exported observation has no completion timestamp")
-            key = (record["profile_id"], record["question_id"], index)
-            raw = {field: record["result"].get(field) for field in retained_fields}
-            candidates.setdefault(key, []).append((sid, raw))
-    if any(counts[sid] != source["observed_samples"] for sid, source in sources.items()):
-        raise AnalysisContractError("Catalog observation counts differ")
-    result = {}
-    for model in models:
-        model_sources = [s for s in sources.values() if s["profile_id"] == model]
-        cutoffs = {s["metadata"]["training_cutoff"] for s in model_sources if s["metadata"].get("training_cutoff")}
-        if len(cutoffs) > 1:
-            raise AnalysisContractError("Profile sources disagree on the training cutoff")
-        cutoff = next(iter(cutoffs), None)
-        normalized, observations, audit = {}, {}, []
-        for source in model_sources:
-            meta = source["metadata"]
-            audit.append({"path": source["path"], "run_id": meta["run_id"], "source_id": source["source_id"],
-                          "cohort": source["cohort"], "collection_contract_hash": source["collection_contract_hash"],
-                          "config_snapshot_sha256": canonical_hash(json.loads(meta["config_snapshot"])),
-                          "source_db_hash": meta["source_db_hash"], "metadata_hash": meta["metadata_hash"],
-                          "prompt_templates_hash": meta["prompt_templates_hash"],
-                          "evidence_gaps": source.get("evidence_gaps", []), "observed_samples": source["observed_samples"]})
-        for qid in ids:
-            q = questions[qid]
-            slots = []
-            for i in range(k):
-                available = candidates.get((model, qid, i), [])
-                # A catalog repair explicitly resolves a failed source; successful answers must be unique.
-                success = [(sid, raw) for sid, raw in available if raw["error"] is None]
-                refused = [(sid, raw) for sid, raw in available if raw["error"] == "content_policy"]
-                chosen = success or refused or available
-                if len({canonical_hash(raw) for _, raw in chosen}) > 1 and (success or refused):
-                    raise AnalysisContractError(f"Conflicting completed catalog observations: {model}/{qid}/s{i}")
-                sid, raw = chosen[0] if chosen else (None, {})
-                if success and any(v["error"] == "content_policy" for _, v in available):
-                    raise AnalysisContractError("A content refusal cannot be replaced by a successful retry")
-                t = _trial(model, q, i, raw, sources[sid]["path"] if sid else None)
-                t["source_id"] = sid
-                t["source_cohort"] = sources[sid]["cohort"] if sid else None
-                slots.append(t)
-            excluded = bool(cutoff and date.fromisoformat(q["end_time"]) <= date.fromisoformat(cutoff))
-            markers = [t["state"] == "cutoff" for t in slots]
-            if any(markers) and not all(markers) and not excluded:
-                raise AnalysisContractError(f"Mixed cutoff and admitted catalog slots: {qid}")
-            if excluded and any(t["state"] not in ("cutoff", "missing") for t in slots):
-                raise AnalysisContractError(f"Catalog result violates the training cutoff: {qid}")
-            if excluded or all(markers):
-                continue
-            normalized[qid] = {"id": qid, "bucket": slots[0]["bucket"], "options": json.loads(q["options"]),
-                               "gold": slots[0]["gold"], "event": q["event"], "end_time": q["end_time"]}
-            observations[qid] = slots
-        result[model] = {"model": model, "sampling_n": k, "questions": normalized, "trials": observations,
-                         "sources": audit, "declared_questions": len(ids), "cutoff_questions": len(ids) - len(normalized)}
-    return result
