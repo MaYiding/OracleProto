@@ -248,6 +248,7 @@ def status(plan: dict) -> dict:
         completed = errors = 0
         successful_slots = set()
         refused_slots = set()
+        deferred_tool_slots = set()
         events = 0
         paths = [path] + [local(ROOT / ref) for ref in plan["runtime"].get("COLLECTION_REFERENCE_DBS", {}).get(name, [])]
         for path in paths:
@@ -261,10 +262,13 @@ def status(plan: dict) -> dict:
                     f"SELECT question_id FROM run_results WHERE s{i}_created_at IS NOT NULL AND s{i}_error IS NULL"))
                 refused_slots.update((row[0], i) for row in conn.execute(
                     f"SELECT question_id FROM run_results WHERE s{i}_created_at IS NOT NULL AND s{i}_error = 'content_policy'"))
+            if plan["runtime"].get("COLLECTION_DEFER_TOOL_FAILURES", False):
+                deferred_tool_slots.update(db.load_deferred_tool_failures(conn, plan["runtime"]["SAMPLING_N"]))
             events += conn.execute("SELECT count(*) FROM request_events WHERE kind LIKE '%.request'").fetchone()[0]
             conn.close()
         refusals = len(refused_slots - successful_slots)
         result["profiles"][name] = {"completed": completed, "errors": errors, "refusals": refusals, "requests": events}
+        result["profiles"][name]["deferred_tool_failures"] = len(deferred_tool_slots - successful_slots - refused_slots)
         result["completed"] += completed
         result["errors"] += errors
         result["refusals"] += refusals
@@ -419,6 +423,7 @@ def excluded_profiles(plan: dict) -> set[str]:
 async def dispatch_batches(plan: dict, env: dict, stop_requested: asyncio.Event | None = None) -> int:
     path = local(COLLECTION / (plan["phase"] + ".json"))
     retain_refusals = plan["runtime"].get("COLLECTION_RETAIN_MODEL_REFUSALS", False)
+    paused = set(plan["runtime"].get("COLLECTION_PAUSED_PROFILES", []))
     for name in plan["runtime"]["MODELS"]:
         target = sample_target(plan["runtime"], name)
         while True:
@@ -427,7 +432,7 @@ async def dispatch_batches(plan: dict, env: dict, stop_requested: asyncio.Event 
                 write_json(path, plan)
                 record_dispatch(plan, "stopped_at_batch_boundary")
                 return 0
-            if name in excluded_profiles(plan):
+            if name in paused or name in excluded_profiles(plan):
                 break
             counts = status(plan)
             done = counts["profiles"].get(name, {}).get("completed", 0)
@@ -471,10 +476,14 @@ async def dispatch_batches(plan: dict, env: dict, stop_requested: asyncio.Event 
                 raise CollectionBlockedError("dispatch made no progress")
     counts = status(plan)
     excluded = excluded_profiles(plan)
-    final_status = "local_queue_complete_pending_delegation" if excluded else (
+    paused_pending = sum(max(0, sample_target(plan["runtime"], name)
+        - counts["profiles"].get(name, {}).get("completed", 0)
+        - (counts["profiles"].get(name, {}).get("refusals", 0) if retain_refusals else 0)) for name in paused)
+    final_status = "pending_paused_profiles" if paused_pending else "local_queue_complete_pending_delegation" if excluded else (
         "complete_with_refusals" if counts.get("refusals") else "complete")
     plan.update(status=final_status,
-                finished_at=db.utcnow_iso(), model_refusals=counts.get("refusals", 0))
+                finished_at=db.utcnow_iso(), model_refusals=counts.get("refusals", 0),
+                paused_profiles=sorted(paused), paused_pending=paused_pending)
     write_json(path, plan)
     return 0
 

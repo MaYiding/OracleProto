@@ -99,7 +99,8 @@ def test_journal_incremental_sync_retains_midnight_outcomes(ledger,tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('terminal_failure',[False,True])
-async def test_queue_drains_one_batch_and_stops_on_terminal_failure(ledger,tmp_path,monkeypatch,terminal_failure):
+@pytest.mark.parametrize('recovery_outcome',[None,'completed','refusals','deferred_tool_failures'])
+async def test_queue_drains_one_batch_and_stops_on_terminal_failure(ledger,tmp_path,monkeypatch,terminal_failure,recovery_outcome):
     import asyncio
     import os
     import signal
@@ -124,26 +125,33 @@ async def test_queue_drains_one_batch_and_stops_on_terminal_failure(ledger,tmp_p
     monkeypatch.setattr(queue,'validate',lambda *args:cfg)
     async def quota(*args):return 1000
     monkeypatch.setattr(queue,'available_searches',quota)
-    observed={'completed':0,'refusals':0};events=[];calls=[]
+    observed={'completed':24 if recovery_outcome else 0,'refusals':0};events=[];calls=[]
     monkeypatch.setattr(queue,'status',lambda p:{'profiles':{'arm':dict(observed)}})
     monkeypatch.setattr(queue,'record_dispatch',lambda p,e,**fields:events.append(e))
     async def evaluate(settings,*args,**kwargs):
         calls.append(settings.COLLECTION_SAMPLE_LIMIT)
         assert kwargs['skip_analysis'] is True
         if terminal_failure:return 4
+        if recovery_outcome and len(calls)==1:
+            observed[recovery_outcome]=observed.get(recovery_outcome,0)+1
+            return 6
         os.kill(os.getpid(),signal.SIGTERM)
         await asyncio.sleep(0.01)
-        observed['completed']=3
+        observed['completed']+=settings.COLLECTION_SAMPLE_LIMIT
         return 6
     monkeypatch.setattr(queue.evaluation,'_run_async',evaluate)
     monkeypatch.setattr(queue.subprocess,'Popen',lambda *args,**kwargs:SimpleNamespace(pid=999999,wait=lambda:0))
     plan={'run_id':'test','runtime':{},'status':'prepared'}
-    spec={'key_alias':'test','plan_path':'plan.json','jobs':[{'profile_id':'arm','requested_model':'gpt-5.4','billing_group':'gpt-5.4','tier':0,'not_before_billing_date':'2026-01-01','expected_samples':6}]}
-    code=await queue.run(spec,plan,{},ledger)
+    spec={'key_alias':'test','plan_path':'plan.json','jobs':[{'profile_id':'arm','requested_model':'gpt-5.4','billing_group':'gpt-5.4','tier':0,'not_before_billing_date':'2026-01-01','expected_samples':900 if recovery_outcome else 6}]}
+    code=await queue.run(spec,plan,{},ledger,'arm' if recovery_outcome else None)
     saved=json.loads((collection/'state.json').read_text())
-    assert calls==[3] and events==['start','finish']
-    assert saved['status']==('blocked' if terminal_failure else 'stopped_at_batch_boundary')
-    assert code==(4 if terminal_failure else 0)
+    blocked=terminal_failure or recovery_outcome=='deferred_tool_failures'
+    assert calls==([1] if blocked else [1,15]) if recovery_outcome else calls==[3]
+    assert events==['start','finish']*len(calls)
+    assert saved['status']==('blocked' if blocked else 'stopped_at_batch_boundary')
+    assert code==(4 if blocked else 0)
+    if recovery_outcome:
+        assert saved['recovery_status']==('pending' if blocked else 'passed')
     assert ledger.execute('SELECT count(*) FROM batches WHERE ended_at IS NULL').fetchone()[0]==0
 
 
@@ -176,3 +184,63 @@ def test_search_retry_count_remains_unknown(ledger,tmp_path,monkeypatch):
     record=billing.export(ledger,'key')['daily_requests'][0]
     assert record['requests']==1 and record['retries'] is None
     assert record['actual_cost'] is None and record['pending']==1
+
+
+@pytest.mark.parametrize("paused", [False, True])
+async def test_tool_failures_do_not_block_other_jobs_or_count_as_complete(ledger,tmp_path,monkeypatch,paused):
+    from types import SimpleNamespace
+    from scripts import run_billing_queue as queue
+    collection=tmp_path/'collection';collection.mkdir()
+    for name,value in [('ROOT',tmp_path),('COLLECTION',collection),('STATE',collection/'state.json')]:
+        monkeypatch.setattr(queue,name,value)
+    monkeypatch.setattr(queue,'digest',lambda p:'hash')
+    monkeypatch.setattr(queue,'prior_ready',lambda:True)
+    for name in ('verify_prior_catalog','check_external'):
+        monkeypatch.setattr(queue,name,lambda:None)
+    monkeypatch.setattr(queue,'excluded_profiles',lambda p:set())
+    monkeypatch.setattr(queue,'capture_execution',lambda p:None)
+    monkeypatch.setattr(billing,'sync_all',lambda c,k:None)
+    monkeypatch.setattr(billing,'export',lambda c,k:{})
+    monkeypatch.setattr(queue.db,'snapshot_settings',lambda s:{})
+    monkeypatch.setattr(queue.shutil,'disk_usage',lambda p:SimpleNamespace(free=20*1024**3))
+    cfg=SimpleNamespace(TAVILY_API_KEY=['test'],COLLECTION_BATCH_SAMPLES=240,COLLECTION_EXPENSIVE_CONCURRENCY=2,LLM_MAX_CONCURRENCY=20)
+    cfg.model_copy=lambda update:SimpleNamespace(**{**cfg.__dict__,**update})
+    monkeypatch.setattr(queue,'validate',lambda *args:cfg)
+    async def quota(*args):return 1000
+    monkeypatch.setattr(queue,'available_searches',quota)
+    observed={n:{'completed':0,'refusals':0,'deferred_tool_failures':0} for n in ('bad','good')}
+    if paused: observed['bad']['deferred_tool_failures']=2
+    monkeypatch.setattr(queue,'status',lambda p:{'profiles':{n:dict(c) for n,c in observed.items()}})
+    monkeypatch.setattr(queue,'record_dispatch',lambda *args,**kwargs:None)
+    calls=[]
+    async def evaluate(settings,*args,**kwargs):
+        name=settings.COLLECTION_MODEL;calls.append(name)
+        observed[name]['deferred_tool_failures' if name=='bad' else 'completed']=3
+        return 6
+    monkeypatch.setattr(queue.evaluation,'_run_async',evaluate)
+    monkeypatch.setattr(queue.subprocess,'Popen',lambda *args,**kwargs:SimpleNamespace(pid=999999,wait=lambda:0))
+    plan={'run_id':'test','runtime':{'COLLECTION_PAUSED_PROFILES':['bad'] if paused else []},'status':'prepared'}
+    spec={'key_alias':'test','plan_path':'plan.json','jobs':[dict(profile_id=n,requested_model=n,billing_group=n,tier=t,
+        not_before_billing_date='2026-01-01',expected_samples=3) for t,n in enumerate(('bad','good'))]}
+    code=await queue.run(spec,plan,{},ledger)
+    saved=json.loads((collection/'state.json').read_text())
+    assert calls==(['good'] if paused else ['bad','good']) and code==0
+    assert saved['status']==('pending_paused_profiles' if paused else 'pending_tool_failures')
+    assert saved['pending']==3 and saved['dispatch_pending']==0
+    assert saved['paused_pending']==(3 if paused else 0)
+    assert saved['deferred_tool_failures']==(0 if paused else 3)
+    assert ledger.execute('SELECT count(*) FROM batches WHERE ended_at IS NULL').fetchone()[0]==0
+    coverage={n:{'expected':3,'collected':c['completed'],'refused':0} for n,c in observed.items()}
+    assert not billing.scope_coverage(spec,coverage)['attempts_complete']
+
+
+def test_paused_profile_releases_priority_but_preserves_billing_claims(ledger):
+    jobs=[dict(profile_id=n,billing_group=g,tier=t,not_before_billing_date='2026-10-03',expected_samples=3)
+          for n,g,t in [('high','model',0),('low','model',1),('other','other',1)]]
+    spec={'key_alias':'key','jobs':jobs}
+    counts={n:{'completed':0,'refusals':0} for n in ('high','low','other')}
+    billing.add_claims(ledger,'key','model','high','2026-10-03T01:00:00+08:00','2026-10-03T01:00:01+08:00','test')
+    ledger.commit()
+    assert [x['profile_id'] for x in ready_jobs(spec,ledger,'2026-10-03T08:00:00+08:00',counts,{'high'})]==['other']
+    assert [x['profile_id'] for x in ready_jobs(spec,ledger,'2026-10-04T00:00:00+08:00',counts,{'high'})]==['low','other']
+    assert [x['profile_id'] for x in ready_jobs(spec,ledger,'2026-10-04T00:00:00+08:00',counts)]==['high']

@@ -1,0 +1,59 @@
+{
+  "release_date": "2026-10-06",
+  "dataset": "MaYiding/OracleProto",
+  "split": "test",
+  "rows": 300,
+  "full_points": 528,
+  "sampling_n": 3,
+  "complete_configurations": 27,
+  "resolved_date_range": [
+    "2026-03-12",
+    "2026-09-21"
+  ],
+  "type_counts": {
+    "yes_no": 100,
+    "binary_named": 9,
+    "mc_single": 154,
+    "mc_multi": 37
+  },
+  "source_database_sha256": "67243aeadbab783202d0c715c5dd01cef265ab41bf729248ff0239d6bcb06c97",
+  "csv_sha256": "b5fa948d8c29044823dbc531065390543715b451918da1efb87d90f110c1c6b0",
+  "prompt_recipe_sha256": "7096361043a30bc18d7ed25701ec01caba12483d7dac564754f82896218e94b8",
+  "scoring_contract": {
+    "aggregation": "100*sum(points*mean_trial_credit)/sum(points)",
+    "bootstrap": "paired_question_clusters_stratified_by_question_type",
+    "bootstrap_iterations": 2000,
+    "bootstrap_seed": 20261001,
+    "ci_level": 0.95,
+    "content_policy": "zero_credit_in_denominator",
+    "cutoff": "exclude_question",
+    "diagnostics": "question_mean_then_population_mean",
+    "headline_population": "intersection_of_declared_admissible_questions",
+    "invalid_answer": "zero_credit_in_denominator",
+    "missing_or_infrastructure_error": "incomplete_no_official_score",
+    "multi_credit": "2TP/(2TP+FP+FN)",
+    "name": "points-f1",
+    "pass_at_k": "mean(1-comb(K-c,k)/comb(K,k))_exact_match",
+    "points": {
+      "binary_named": 1,
+      "mc_multi": 3,
+      "mc_single": 2,
+      "yes_no": 1
+    },
+    "single_credit": "exact_set_equality",
+    "vote": "strict_majority_of_complete_answer_sets_invalid_votes_abstain"
+  },
+  "cost_basis": "Public standard online tariffs repriced per request, sum of three repetitions divided by three; forecasting-model inference only. Excludes search, leakage-detector usage, missing usage, and invoice totals.",
+  "leakage_audit": {
+    "source": "author-reported final audit",
+    "auditor": "GPT 6.1 Sol",
+    "reviewed": 10000,
+    "positive_labels": 137,
+    "rate_percent": 1.37,
+    "human_verified_positives": 137,
+    "human_confirmed_leaks": 137,
+    "human_verified_negative_labels": 1000,
+    "human_found_leaks_in_negative_sample": 0
+  },
+  "results_source": "Frozen complete 300-question panel"
+}

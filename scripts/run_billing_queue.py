@@ -1,6 +1,7 @@
 """Dispatch authorized collection arms on separate billing days, after the active queue drains."""
 from __future__ import annotations
 
+import argparse
 import asyncio
 import fcntl
 import hashlib
@@ -41,8 +42,13 @@ def read(path): return json.loads(local(path).read_text())
 def key_alias(env): return 'aihubmix-'+hashlib.sha256(env['LLM_API_KEY'].encode()).hexdigest()[:16]
 
 
-def ready_jobs(spec,ledger,at,counts):
-    pending=[job for job in billing.runnable_jobs(spec) if counts[job['profile_id']]['completed']+counts[job['profile_id']].get('refusals',0)<job['expected_samples']]
+def dispatch_accounted(count):
+    return count['completed']+count.get('refusals',0)+count.get('deferred_tool_failures',0)
+
+
+def ready_jobs(spec,ledger,at,counts,paused_profiles=()):
+    pending=[job for job in billing.runnable_jobs(spec) if job['profile_id'] not in paused_profiles
+             and dispatch_accounted(counts[job['profile_id']])<job['expected_samples']]
     if not pending:return []
     tier=min(job['tier'] for job in pending)
     day=billing.timestamp(at).astimezone(billing.ZONE).date().isoformat()
@@ -126,10 +132,12 @@ def check_external():
             raise ValueError('External return requires verified intake before further collection: '+item['profile_id'])
 
 
-async def run(spec,plan,env,ledger):
+async def run(spec,plan,env,ledger,recovery_profile=None):
     stop=asyncio.Event(); loop=asyncio.get_running_loop()
     loop.add_signal_handler(signal.SIGTERM,stop.set);loop.add_signal_handler(signal.SIGINT,stop.set)
     state={'status':'waiting_for_original_queue','pid':os.getpid(),'started_at':now(),'schedule_sha256':digest(SPEC)}
+    if recovery_profile:
+        state.update(recovery_profile=recovery_profile,recovery_status='pending')
     collected=False
     predecessor_verified=False
     def save(**fields):
@@ -157,7 +165,8 @@ async def run(spec,plan,env,ledger):
                         verify_prior_catalog();predecessor_verified=True
                     validate(spec,plan,env)
                     billing.sync_all(ledger,spec['key_alias']); billing.export(ledger,spec['key_alias'])
-                    counts=status(plan)['profiles']; ready=ready_jobs(spec,ledger,now(),counts)
+                    paused=set(plan['runtime'].get('COLLECTION_PAUSED_PROFILES',[]))
+                    counts=status(plan)['profiles']; ready=ready_jobs(spec,ledger,now(),counts,paused)
                     pending=sum(job['expected_samples']-counts[job['profile_id']]['completed']-counts[job['profile_id']].get('refusals',0) for job in billing.runnable_jobs(spec))
                     if pending<0:raise ValueError('Observed slots exceed the authorized target')
                     save(counts=counts,pending=pending,
@@ -166,19 +175,31 @@ async def run(spec,plan,env,ledger):
                                                if job.get('dispatch_status','runnable')!='runnable'])
                     if not pending:
                         save(status='collection_complete_pending_catalog');break
+                    held=[{'profile_id':job['profile_id'],
+                           'pending':job['expected_samples']-counts[job['profile_id']]['completed']-counts[job['profile_id']].get('refusals',0)}
+                          for job in billing.runnable_jobs(spec) if job['profile_id'] in paused]
+                    paused_pending=sum(row['pending'] for row in held)
+                    deferred=sum(counts[job['profile_id']].get('deferred_tool_failures',0) for job in billing.runnable_jobs(spec) if job['profile_id'] not in paused)
+                    save(deferred_tool_failures=deferred,paused_profiles=held,paused_pending=paused_pending,
+                         dispatch_pending=pending-paused_pending-deferred)
+                    if paused_pending+deferred==pending:
+                        save(status='pending_paused_profiles' if paused_pending else 'pending_tool_failures',active_profile=None);break
                     if not ready:
                         save(status='waiting_for_billing_day',active_profile=None)
                     else:
                         job=ready[0];name=job['profile_id']
+                        if recovery_profile and name!=recovery_profile:
+                            raise ValueError('Recovery profile must be the next eligible job')
                         if name in excluded_profiles(plan):raise ValueError('Selected profile is locally excluded: '+name)
                         settings=validate(spec,plan,env)
                         if shutil.disk_usage(ROOT).free<10*1024**3:raise ValueError('Disk reserve reached')
                         remaining=await available_searches(settings.TAVILY_API_KEY,plan)
-                        done=counts[name]['completed']+counts[name].get('refusals',0)
+                        done=dispatch_accounted(counts[name])
                         costly=expensive(job['requested_model']) or job['requested_model'].startswith('gemini-3.1-pro')
                         cap=min(3 if done==0 else 15 if costly else settings.COLLECTION_BATCH_SAMPLES,
                                 job['expected_samples']-done,max(0,(remaining-100)//12*3))
                         if cap<min(3,job['expected_samples']-done):raise ValueError(f'Tavily reserve reached: {remaining} cached/queried estimate')
+                        if recovery_profile:cap=1
                         if stop.is_set():break
                         # The date may have changed during quota checks.
                         if billing.blockers(ledger,spec['key_alias'],job['billing_group'],name,now()):continue
@@ -200,7 +221,14 @@ async def run(spec,plan,env,ledger):
                         after=status(plan)['profiles'][name]
                         record_dispatch(plan,'finish',profile=name,exit_code=code,counts=after,billing_reservation=token)
                         if code not in (0,6):raise ValueError(f'evaluation exit {code}; inspect raw journal; no automatic retry')
-                        if after['completed']+after.get('refusals',0)<=done:raise ValueError('No collection progress')
+                        if dispatch_accounted(after)<=done:raise ValueError('No collection progress')
+                        if recovery_profile:
+                            terminal_before=counts[name]['completed']+counts[name].get('refusals',0)
+                            terminal_after=after['completed']+after.get('refusals',0)
+                            if terminal_after-terminal_before!=1:
+                                raise ValueError('Recovery sample did not reach a successful or retained-refusal result')
+                            save(recovery_status='passed',recovery_finished_at=now())
+                            recovery_profile=None
                         plan.update(status='running',active_profile=name,updated_at=now());write_json(local(ROOT/spec['plan_path']),plan)
             if state['status']=='waiting_for_billing_day':
                 try:await asyncio.wait_for(stop.wait(),60)
@@ -213,7 +241,7 @@ async def run(spec,plan,env,ledger):
         save(status='blocked',block_reason=message,stopped_at=now());logger.error('Billing queue stopped: {}',message)
     finally:
         loop.remove_signal_handler(signal.SIGTERM);loop.remove_signal_handler(signal.SIGINT)
-    if collected or state['status']=='collection_complete_pending_catalog':
+    if collected or state['status'] in ('collection_complete_pending_catalog','pending_tool_failures','pending_paused_profiles'):
         # Keep both writer locks while the catalog takes its final source snapshot.
         with local(COLLECTION/'authorized_sequence.lock').open('a+') as a, local(COLLECTION/'collection.lock').open('a+') as b:
             fcntl.flock(a,fcntl.LOCK_EX|fcntl.LOCK_NB);fcntl.flock(b,fcntl.LOCK_EX|fcntl.LOCK_NB)
@@ -233,15 +261,22 @@ async def run(spec,plan,env,ledger):
 
 def main():
     if ROOT.resolve()!=Path('/Users/mayiding/Desktop/Git/Forecast'):raise ValueError('Unexpected project root')
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--validate-only',action='store_true')
+    parser.add_argument('--ledger-only',action='store_true')
+    parser.add_argument('--recovery-profile',help='Require one terminal sample before resuming normal batches for the next eligible profile')
+    args=parser.parse_args()
     os.environ['NO_PROXY']=os.environ['no_proxy']='localhost,127.0.0.1'
     spec=read(SPEC);plan=read(ROOT/spec['plan_path']);env=dotenv_values(local(ROOT/'.env'))
     validate(spec,plan,env)
-    if '--validate-only' in sys.argv:
+    if args.recovery_profile and args.recovery_profile not in {job['profile_id'] for job in billing.runnable_jobs(spec)}:
+        raise ValueError('Recovery profile is outside the selected runnable scope')
+    if args.validate_only:
         logger.info('Validated {} billing-isolated profiles; no network calls',len(spec['jobs']));return 0
     with local(COLLECTION/'billing_schedule.lock').open('a+') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         ledger=billing.open_ledger()
-        if '--ledger-only' in sys.argv:
+        if args.ledger_only:
             billing.sync_all(ledger,spec['key_alias']);result=billing.export(ledger,spec['key_alias'])
             logger.info('Updated {} daily records and {} conflict days',len(result['daily_requests']),len(result['conflicts']));return 0
         directory=local(ROOT/'runs'/plan['run_id']/'billing_code');directory.mkdir(parents=True,exist_ok=True)
@@ -252,7 +287,7 @@ def main():
             if digest(target)!=sha:raise ValueError('Billing code capture mismatch')
             evidence[name]={'sha256':sha,'copy':str(target.relative_to(ROOT))}
         write_json(local(directory/'manifest.json'),{'captured_at':now(),'files':evidence,'schedule_sha256':digest(SPEC)})
-        return asyncio.run(run(spec,plan,env,ledger))
+        return asyncio.run(run(spec,plan,env,ledger,args.recovery_profile))
 
 
 if __name__=='__main__':raise SystemExit(main())

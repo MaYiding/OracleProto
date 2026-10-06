@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="180" viewBox="0 0 1000 180" role="img" aria-labelledby="title desc">
+<title id="title">OracleProto benchmark at a glance</title><desc id="desc">300 questions, 528 available points, 3 repetitions per question, 27 complete model configurations.</desc>
+<defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#101d43"/><stop offset="1" stop-color="#272158"/></linearGradient></defs>
+<rect width="1000" height="180" rx="22" fill="url(#bg)"/>
+<path d="M760 0 Q880 60 1000 20 M725 0 Q870 120 1000 65" fill="none" stroke="#7772b8" opacity=".3"/>
+<g font-family="Arial,Helvetica,sans-serif" text-anchor="middle">
+<g fill="#fff" font-size="48" font-weight="700"><text x="125" y="88">300</text><text x="375" y="88">528</text><text x="625" y="88">3</text><text x="875" y="88">27</text></g>
+<g fill="#cccfea" font-size="15" letter-spacing="1.2"><text x="125" y="123">QUESTIONS</text><text x="375" y="123">AVAILABLE POINTS</text><text x="625" y="123">REPETITIONS</text><text x="875" y="123">CONFIGURATIONS</text></g>
+</g><path d="M250 48v84 M500 48v84 M750 48v84" stroke="#777c9f" opacity=".35"/></svg>

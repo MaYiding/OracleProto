@@ -351,6 +351,8 @@ async def run(
     sampling_n = settings.SAMPLING_N
     models = list(conns.keys())
 
+    deferred_tool_slots = {m: dbmod.load_deferred_tool_failures(conns[m], sampling_n)
+                           if settings.COLLECTION_DEFER_TOOL_FAILURES else set() for m in models}
     # Per-model resume set
     completed: dict[str, set[tuple[str, int]]] = {
         m: dbmod.load_completed_samples(conns[m], sampling_n,
@@ -385,6 +387,8 @@ async def run(
                         contract.pop("LEAK_DETECTOR_DROP_CONTENT_POLICY", None)
                 if before != after:
                     raise ValueError("reference DB inference contract differs")
+                if settings.COLLECTION_DEFER_TOOL_FAILURES:
+                    deferred_tool_slots[model].update(dbmod.load_deferred_tool_failures(source, sampling_n))
                 completed[model].update(dbmod.load_completed_samples(source, sampling_n,
                     retain_model_refusals=settings.COLLECTION_RETAIN_MODEL_REFUSALS))
             finally:
@@ -397,6 +401,9 @@ async def run(
         settings_factory=settings_factory,
     )
     total_pending = len(todo)
+    todo = [task for task in todo
+            if (task.question.id, task.sample_idx) not in deferred_tool_slots[task.model]
+            and (dbmod.parse_virtual_slug(task.model) or (task.model,))[0] not in settings.COLLECTION_PAUSED_PROFILES]
     if settings.COLLECTION_MODEL:
         todo = [task for task in todo if
                 (dbmod.parse_virtual_slug(task.model) or (task.model,))[0] == settings.COLLECTION_MODEL]
@@ -452,7 +459,11 @@ async def run(
             dbmod.audit_event("sample.result", row)
         kind = row.get("error")
         retained_refusal = settings.COLLECTION_RETAIN_MODEL_REFUSALS and kind == ErrorKind.CONTENT_POLICY
-        blocks_collection = bool(kind and settings.REQUIRE_HEALTHY_RETRIEVAL and not retained_refusal)
+        deferred_tool_failure = settings.COLLECTION_DEFER_TOOL_FAILURES and kind == ErrorKind.TOOL_USE_FAILED
+        if deferred_tool_failure:
+            stats.deferred += 1
+        blocks_collection = bool(kind and settings.REQUIRE_HEALTHY_RETRIEVAL
+                                 and not retained_refusal and not deferred_tool_failure)
         if blocks_collection and settings.COLLECTION_DRAIN_ON_ERROR:
             admission_closed.set()
         await writers[task.model].enqueue_result(row)

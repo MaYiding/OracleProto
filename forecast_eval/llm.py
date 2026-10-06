@@ -13,6 +13,8 @@ from .db import audit_event
 from .errors import (
     AuthError,
     ErrorKind,
+    ToolGenerationError,
+    tool_generation_message,
     backoff_seconds,
     classify,
     parse_retry_after,
@@ -108,6 +110,35 @@ def _serialise_message(msg: Any) -> dict[str, Any]:
     raise TypeError(f"cannot serialise message of type {type(msg)!r}")
 
 
+def _wire_messages(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    wire = list(messages)
+    normalizations = []
+    for message_index, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        for call_index, call in enumerate(message.get("tool_calls") or []):
+            function = call.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            if isinstance(name, str) and name.strip():
+                continue
+            # ReAct rejects this call as unknown. A non-executable label lets
+            # providers parse its history without inventing a valid search.
+            if wire[message_index] is message:
+                wire[message_index] = {**message, "tool_calls": list(message["tool_calls"])}
+            wire[message_index]["tool_calls"][call_index] = {
+                **call, "function": {**function, "name": "invalid_tool_call"},
+            }
+            normalizations.append({
+                "message_index": message_index, "tool_call_index": call_index,
+                "tool_call_id": call.get("id"), "field": "function.name",
+                "original_present": "name" in function, "original_value": name,
+                "wire_value": "invalid_tool_call",
+            })
+    return wire, normalizations
+
+
 def _extract_usage(raw_usage: Any) -> Usage:
     if raw_usage is None:
         return Usage()
@@ -179,6 +210,7 @@ async def chat(
     ).get(model, "max_tokens")
     if profile is not None and profile.max_tokens_param is not None:
         max_tokens_param = profile.max_tokens_param
+    messages, message_normalizations = _wire_messages(messages)
     base_kwargs: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -216,6 +248,7 @@ async def chat(
         request_id = audit_event("llm.request", {
             "endpoint": str(settings.LLM_BASE_URL).rstrip("/") + "/chat/completions",
             "body": {**wire_body, **extra_body}, "attempt": attempt,
+            **({"message_normalizations": message_normalizations} if message_normalizations else {}),
         })
         try:
             raw = await c.chat.completions.with_raw_response.create(**base_kwargs)
@@ -229,6 +262,8 @@ async def chat(
             kind = classify(exc)
             if kind is ErrorKind.AUTH:
                 raise AuthError(str(exc)) from exc
+            if kind is ErrorKind.TOOL_USE_FAILED:
+                raise ToolGenerationError(tool_generation_message(exc) or str(exc), request_id) from exc
             last_exc = exc
             if not should_retry(kind):
                 raise

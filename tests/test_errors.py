@@ -144,3 +144,19 @@ def test_parse_retry_after_numeric() -> None:
     assert parse_retry_after(H({})) is None
     assert parse_retry_after(H({"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"})) is None
     assert parse_retry_after(None) is None
+
+
+@pytest.mark.parametrize("message", [
+    "Tool call validation failed: parameters for tool web_search did not match schema: missing properties: 'query'",
+    "Tool choice is none, but model called a tool (tid: fixture)",
+])
+def test_generated_tool_failure_is_not_a_transport_retry(message):
+    import json
+    body = json.dumps({"error": {"code": "tool_use_failed", "message": message}})
+    assert classify(_http_error(400, body)) is ErrorKind.TOOL_USE_FAILED
+    assert not should_retry(ErrorKind.TOOL_USE_FAILED)
+    assert classify(_http_error(401, body)) is ErrorKind.AUTH
+    assert classify(_http_error(429, body)) is ErrorKind.RATE_LIMIT
+    assert classify(_http_error(503, body)) is ErrorKind.SERVER_5XX
+    assert classify(_http_error(400, body.replace("tool_use_failed", "invalid_request"))) is ErrorKind.BAD_REQUEST
+    assert classify(_http_error(400, '{"error":{"code":"tool_use_failed","message":"Invalid tools schema"}}')) is ErrorKind.BAD_REQUEST

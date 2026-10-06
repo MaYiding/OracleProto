@@ -490,6 +490,10 @@ class Settings(BaseSettings):
     """Maximum new samples per dispatch, with zero meaning unlimited."""
     COLLECTION_RETAIN_MODEL_REFUSALS: bool = False
     """Keep forecast-provider content refusals as terminal observations, without retrying their slots."""
+    COLLECTION_DEFER_TOOL_FAILURES: bool = False
+    """Continue other slots after exhausted generated-tool errors; keep failed slots pending."""
+    COLLECTION_PAUSED_PROFILES: list[str] = Field(default_factory=list)
+    """Profiles whose pending slots stay in coverage but are not automatically dispatched."""
     COLLECTION_DRAIN_ON_ERROR: bool = False
     """Stop admitting samples after a fatal error while finishing samples already started."""
     COLLECTION_EXPENSIVE_CONCURRENCY: int = Field(default=1, ge=1, le=20)
@@ -696,8 +700,14 @@ class Settings(BaseSettings):
     def _post_validate(self) -> "Settings":
         if self.COLLECTION_RETAIN_MODEL_REFUSALS and not self.WRITE_REQUEST_AUDIT:
             raise ValueError("COLLECTION_RETAIN_MODEL_REFUSALS requires WRITE_REQUEST_AUDIT")
+        if self.COLLECTION_DEFER_TOOL_FAILURES and not self.WRITE_REQUEST_AUDIT:
+            raise ValueError("COLLECTION_DEFER_TOOL_FAILURES requires WRITE_REQUEST_AUDIT")
         if not self.MODELS:
             raise ValueError("MODELS must not be empty")
+        if set(self.COLLECTION_PAUSED_PROFILES) - set(self.MODELS):
+            raise ValueError("COLLECTION_PAUSED_PROFILES must be declared in MODELS")
+        if len(set(self.COLLECTION_PAUSED_PROFILES)) != len(self.COLLECTION_PAUSED_PROFILES):
+            raise ValueError("COLLECTION_PAUSED_PROFILES must be unique")
         if set(self.MODEL_PROFILES) - set(self.MODELS):
             raise ValueError("MODEL_PROFILES keys must be declared in MODELS")
         if set(self.MODEL_SAMPLE_INDICES) - set(self.MODELS):

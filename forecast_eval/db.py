@@ -705,6 +705,13 @@ def finish_run_meta(
     )
 
 
+def load_deferred_tool_failures(conn: sqlite3.Connection, sampling_n: int) -> set[tuple[str, int]]:
+    """Failed slots excluded from automatic dispatch, never from pending coverage."""
+    return {(row[0], i) for i in range(sampling_n) for row in conn.execute(
+        f"SELECT question_id FROM run_results WHERE s{i}_created_at IS NOT NULL "
+        f"AND s{i}_error = 'tool_use_failed'")}
+
+
 def load_completed_samples(
     conn: sqlite3.Connection,
     sampling_n: int,

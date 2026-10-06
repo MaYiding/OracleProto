@@ -1,55 +1,43 @@
 <div align="center">
+<img src="static/images/OracleProto_Logo_Horizontal.svg" alt="OracleProto" width="360">
 
-<img src="static/images/OracleProto_Logo_Horizontal.png" alt="OracleProto Logo" width="100%">
+**A reproducible framework for benchmarking LLM native forecasting**
 
-<em>A reproducible framework for benchmarking LLM native forecasting via knowledge cutoff and temporal masking</em>
+Knowledge cutoff · Temporal masking · Auditable retrieval
 
+[![CI](https://github.com/MaYiding/OracleProto/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MaYiding/OracleProto/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/Python-3.12-42558c?style=flat-square)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-6752a8?style=flat-square)](LICENSE)
+
+[Leaderboard](https://oracleproto.com) · [Dataset](https://huggingface.co/datasets/MaYiding/OracleProto) · [Paper](https://arxiv.org/abs/2605.03762) · [中文](README-ZH.md)
+
+<img src="static/images/benchmark-overview.svg" alt="300 questions, 528 points, 3 repetitions, 27 configurations" width="100%">
 </div>
 
-$`\Large \text{Forecasting} = \text{Gathering} \times \text{Synthesis} \times \text{Judgment} \times \text{Decision}`$
+## Forecasting with a declared information boundary
 
-<div align="center">
+OracleProto reconstructs resolved events as forecasting tasks with a model knowledge cutoff and a time limit on retrieval. Search results pass through a separate leakage detector, provider-native browsing is disabled, and the run records the prompts, answers and resource usage needed to inspect a result. `event` and `end_time` identify the event; the retrieval cutoff stays in the tool layer.
 
-Traditional benchmarks ask: “Can you recall the answer?”<br>
-OracleProto asks: “Can you predict the future?”
+The public paper benchmark contains **300 questions** resolved from **2026-03-12 to 2026-09-21**. The complete evaluation covers **27 model configurations** with **three repetitions**, for **24,300 answers**. [Result CSVs](data/results/score_summary.csv) and the [scoring contract](data/results/benchmark_manifest.json) accompany the dataset.
 
-<b>May every forecast be reproducible, may AI truly become decision support</b><br>
-In service of every person’s judgments and choices for a good life
+| Question type | Questions | Points per question | Available points |
+| --- | ---: | ---: | ---: |
+| Yes/no | 100 | 1 | 100 |
+| Named binary | 9 | 1 | 9 |
+| Single-answer multiple choice | 154 | 2 | 308 |
+| Multi-answer multiple choice | 37 | 3 | 111 |
+| **Total** | **300** | | **528** |
 
-![GitHub License](https://img.shields.io/badge/License-MIT-brightgreen?style=for-the-badge)
-![Python Version](https://img.shields.io/badge/Python-3.12-brightgreen?style=for-the-badge)
+**Score is the primary metric.** Exact-answer questions earn all or none of their points. Multi-answer questions earn option-level F1 credit. Accuracy, selection errors, repeated answers and inference costs explain Score; they do not replace it. The [live leaderboard](https://oracleproto.com) presents the complete results.
 
-[English](./README.md) | [中文文档](./README-ZH.md) | [Hugging Face](https://huggingface.co/datasets/MaYiding/OracleProto)
+The final filtered-retrieval audit uses **GPT 6.1 Sol's 137 leakage labels among 10,000 reviewed results, or 1.37%**. Human review confirmed all 137 positives and found no leakage in 1,000 sampled negative labels. This audit concerns retrieved content; it does not establish a model's training-data boundary.
 
-View Our Paper: [arXiv](http://arxiv.org/abs/2605.03762)
+<details>
+<summary>View the framework</summary>
 
-Visit Our Leaderboards: [oracleproto.com](https://oracleproto.com)
+<img src="static/images/Framework.png" alt="OracleProto information boundaries and evaluation flow" width="100%">
 
-</div>
-
----
-
-## Overview
-
-- **Background & Challenges:** Evaluating LLM forecasting faces a dilemma: live benchmarks **expire easily**, and retrospective benchmarks suffer from **data leakage**. Prompting cannot establish a genuine **knowledge boundary**.
-  
-- **Architecture & Methods:** The OracleProto framework combines model knowledge cutoffs and temporal masking to rigorously reconstruct historical events into **reproducible, time-bounded forecasting samples**.
-
-- **Prompt Rendering:** Each task prompt separates `event` from `end_time`. `end_time` is the resolution date that identifies the event instance; the search cutoff $`\chi_i`$ remains injected only inside the tool layer.
-  
-- **Experimental Results:** Tests on six contemporary LLMs show that OracleProto distinguishes models' forecasting quality, stability, and cost efficiency. It reduces the leakage rate to 1%, providing a controlled signal source for **model comparison, supervised fine-tuning, and reinforcement learning**.
-
-<div align="center">
-
-<img src="static/images/Framework.png" alt="Framework of OracleProto" width="100%">
-
-Framework of OracleProto
-
-<img src="static/images/preview/2-EN.png" alt="Online Leaderboard Overview of OracleProto" width="100%">
-
-Online Leaderboard Overview of OracleProto
-
-</div>
+</details>
 
 ---
 
@@ -130,9 +118,9 @@ The bundled `forecast_eval_set_example.db` is a SQLite source generated from
 `futurex-ai/Futurex-Past`. It contains one table, `test_cases`, with seven
 columns: `id`, `choice_type`, `question_type`, `event`, `options`, `answer`,
 and `end_time`. The table has 300 curated Level 1/2 rows spanning 2026-03-19 to
-2026-09-22. It contains 130 binary questions (yes/no or two named options),
-130 single-answer questions with at least three options, and 40 multi-answer
-questions. Sports and esports account for 54 questions (18%).
+2026-09-22. It contains 104 binary questions (97 yes/no and 7 named binary),
+156 single-answer questions with at least three options, and 40 multi-answer
+questions.
 
 To plug in another corpus, create a SQLite table with the same seven columns
 and point `SOURCE_DB` and `SOURCE_TABLE` at it in `.env`. A source DB does not
@@ -140,6 +128,26 @@ need `dataset_metadata`; when that table is absent, the loader uses
 `forecast_eval.prompts.DEFAULT_PROMPT_TEMPLATES`. Add
 `dataset_metadata.features_json.prompt_reconstruction` only when the dataset
 must carry its own eleven prompt-template keys.
+
+### Reproduce the paper benchmark
+
+The bundled example and the paper benchmark are different 300-question sets. For the paper results, download the fixed [Hugging Face SQLite release](https://huggingface.co/datasets/MaYiding/OracleProto/resolve/main/forecast_eval_set_example.db) and use its stored shared prompt recipe:
+
+```bash
+curl -L https://huggingface.co/datasets/MaYiding/OracleProto/resolve/main/forecast_eval_set_example.db -o oracleproto_300.db
+```
+
+```dotenv
+SOURCE_DB=./oracleproto_300.db
+SOURCE_TABLE=test_cases
+PROMPT_TEMPLATE_STYLE=shared
+SAMPLING_N=3
+REACT_MAX_STEPS=6
+REACT_MAX_SEARCH_CALLS=4
+TAVILY_MAX_RESULTS=5
+```
+
+The release manifest pins the source SHA-256 and scoring contract. Explicit reasoning settings and provider defaults remain separate configurations. `High` routes and thinking switches do not imply the same provider budget. The shared prompt's strict-answer instruction is preserved as collected; the published scorer awards F1 partial credit for multi-answer questions.
 
 ---
 
@@ -165,7 +173,7 @@ python -B -m forecast_eval.analysis runs/{run_id}
 
 For collection across batches, use `python -B -m forecast_eval.analysis runs/collection_300/catalog.json --profiles PROFILE_ID ...`. Refresh the catalog in the collection workflow and explicitly select completed profiles; the catalog can also contain reasoning profiles that have not started. Scoring checks corpus and observation-export hashes and retains reference, continuation, repair, and detector strata. Output is `runs/collection_300/analysis/score/`.
 
-`score_report.md` and `score_summary.csv` report the common-question panel. `score_by_type.csv` shows all four types; `selection_diagnostics.csv` separates extra, missed, and substituted selections; `score_by_trial.csv` and the pass/vote columns describe repeated answers. Definitions and research choices are in [DESIGN §4](DESIGN.md#4-hierarchical-evaluation); output fields are in [FRAME §9](FRAME.md#9-metrics).
+`score_report.md` and `score_summary.csv` report the common-question panel. `score_by_type.csv` shows all four types; `selection_diagnostics.csv` separates extra, missed, and substituted selections; `score_by_trial.csv` and the pass/vote columns describe repeated answers. Definitions are in the [scoring contract](data/results/benchmark_manifest.json); output fields follow the [report implementation](forecast_eval/analysis/score_report.py).
 
 The scorer reads stored answers even when `correct` is NULL and never updates raw DBs. Declared reference DBs are joined by model/question/trial with conflict checks. Missing samples or infrastructure failures stop official scoring with exit code 2 and a coverage report. `--allow-incomplete` permits diagnostics while affected scores remain empty. Model refusals and invalid answers earn zero. Cutoff-excluded questions are excluded. The fixed scoring contract, source configuration hashes, observations, and implementation are fingerprinted in `scoring_meta.json`.
 
@@ -204,6 +212,9 @@ If you use this project in your research, please cite our paper:
 
 ---
 
+<details>
+<summary>Advanced collection controls</summary>
+
 ## Collect raw predictions with fixed reasoning profiles
 
 `MODEL_PROFILES` maps experiment-arm IDs to provider model IDs and explicit reasoning parameters. `MODELS` lists the arm IDs. Keep `TAVILY_MAX_RESULTS=5`, `REACT_MAX_SEARCH_CALLS=4`, `REACT_MAX_STEPS=6`, and `SAMPLING_N=3` for the paper collection budget. A provider-default arm has no declared effort and remains distinct from an explicit `none` or `high` arm.
@@ -222,7 +233,11 @@ Deferred or delegated profiles can be excluded from the local queue with `runs/c
 
 After receiving delegated runs, verify the sender’s checksums and confirm collection has stopped before setting each entry in `delegated_results.json` to `verified_return` with its project-relative `returned_artifacts` SHA-256 map. The catalog validates the fixed assignment, execution snapshots, raw journal, and inference contract before indexing those runs as independent sources. Unverified returns remain pending.
 
-`COLLECTION_RETAIN_MODEL_REFUSALS=true` preserves forecast-provider content refusals and continues other slots. It requires request auditing and skips retained refusals on resume. The catalog reports them separately from predictions; other terminal errors still stop strict collection.
+`COLLECTION_RETAIN_MODEL_REFUSALS=true` preserves forecast-provider content refusals and continues other slots. It requires request auditing and skips retained refusals on resume. The catalog reports them separately from predictions; other terminal errors stop strict collection unless generated-tool failure deferral is enabled.
+
+`COLLECTION_PAUSED_PROFILES` lists authorized profiles to hold while other profiles continue. Their remaining slots stay pending until an explicit resume. Set this list in the collection plan’s `runtime`.
+
+`COLLECTION_DEFER_TOOL_FAILURES=true` lets other slots continue when a model exhausts its fixed round budget on provider-rejected tool generations. Failed slots retain their request evidence and remain pending; they are neither counted as complete nor automatically retried. Request auditing is required. Search, authentication, quota, and other service failures still stop strict collection.
 
 `LEAK_DETECTOR_RESPONSE_FORMAT=json_object` requests valid JSON from a supporting detector endpoint. `python scripts/catalog_collection.py` links reference and collected samples in `runs/collection_300/catalog.json` and exports observations with consistent field names, retaining source strata and raw values without scoring. Its coverage checklist identifies every pending model/question/sample slot. The observation export uses lossless gzip compression.
 
@@ -233,3 +248,5 @@ The 300-question collection sets `LEAK_DETECTOR_MAX_TOKENS=2048`. A different de
 `python scripts/collect_forecast_panel.py plan --phase repair` prepares isolated retries for recorded reference failures. `MODEL_SAMPLE_INDICES` restricts each question to its failed sample slots, preserving completed samples and the declared sampling count. The repair run shares the collection lock and can start once the active collector releases it.
 
 The anchored panel workflow uses `python scripts/prepare_collection.py`, `python scripts/collect_forecast_panel.py plan`, `python scripts/probe_collection.py`, and `python scripts/collect_forecast_panel.py run`. Its private plan and inventory live under `runs/collection_300/`; `python scripts/collect_forecast_panel.py status` reports collection counts without scoring. API credentials remain in `.env`.
+
+</details>

@@ -297,6 +297,68 @@ async def test_dropped_evidence_and_reasons_never_enter_model_context():
     assert result.to_llm_payload() == {"results": []}
 
 
+@pytest.mark.parametrize("function", [{"arguments": "{}"}, {"name": None, "arguments": "{}"},
+                                     {"name": "", "arguments": "{}"}])
+@respx.mock
+async def test_nameless_tool_call_preserves_raw_response_and_fixed_budget(tmp_path, monkeypatch, function):
+    config = settings(
+        SCORE_ANSWERS=False, WRITE_REQUEST_AUDIT=True, WRITE_MESSAGES_TRACE=True,
+        REACT_REFLECTION_PROTOCOL=False, REACT_MAX_STEPS=6, REACT_MAX_SEARCH_CALLS=[4],
+        REACT_MIN_SEARCH_CALLS=0, REACT_MAX_NUDGES=0, REACT_FORCE_FINAL_ANSWER_NEAR_LIMIT=False,
+        LLM_BASE_URL="https://provider.test/v1",
+    ).model_copy(update={"TAVILY_MAX_RESULTS": 5, "REACT_MAX_SEARCH_CALLS": 4})
+    malformed = {"id": "call_bad", "type": "function", "function": function}
+    first = _success_body()
+    first["choices"][0]["message"] = _tool_msg("call_good", "bounded evidence query")
+    first["choices"][0]["message"]["tool_calls"].append(malformed)
+    first["choices"][0]["finish_reason"] = "tool_calls"
+    requests = []
+
+    def respond(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        if len(requests) == 1:
+            return httpx.Response(200, json=first)
+        assistant = next(m for m in body["messages"] if m.get("tool_calls"))
+        calls = assistant["tool_calls"]
+        assert calls[0]["function"]["name"] == "web_search"
+        assert calls[1]["function"] == {**function, "name": "invalid_tool_call"}
+        tool_results = [m for m in body["messages"] if m["role"] == "tool"]
+        assert [m["tool_call_id"] for m in tool_results] == ["call_good", "call_bad"]
+        assert json.loads(tool_results[1]["content"])["error"].startswith("unknown tool:")
+        return httpx.Response(200, json=_success_body())
+
+    model = respx.post("https://provider.test/v1/chat/completions").mock(side_effect=respond)
+    search = respx.post("https://api.tavily.com/search").respond(200, json={"results": []})
+    monkeypatch.setattr(react, "llm_chat", llm.chat)
+    monkeypatch.setattr(react, "parse_gt", lambda _: pytest.fail("collection must not score gold"))
+    conn = db.connect(tmp_path / "nameless.db")
+    db.init_schema(conn, 1)
+    async with AsyncOpenAI(api_key="test-key", base_url=config.LLM_BASE_URL, max_retries=0) as client:
+        monkeypatch.setattr(llm, "get_client", lambda _: client)
+        with db.capture_requests(conn, settings=config, run_id="r", model="test-arm", question_id="q", sample_idx=0):
+            result = await react.run_react(_yes_no_question(), model="test-arm", sample_idx=0,
+                                          settings=config, templates=DEFAULT_PROMPT_TEMPLATES, run_id="r")
+    assert model.call_count == 2 and search.call_count == 1
+    assert result.react_steps == 2 and result.tool_calls_count == 1 and result.correct is None
+    assert result.error is None and result.final_answer_retry_used == 0
+    trace = json.loads(result.messages_trace)
+    assert next(m for m in trace if m.get("tool_calls"))["tool_calls"][1] == malformed
+    assert first["choices"][0]["message"]["tool_calls"][1] == malformed
+    events = conn.execute("SELECT kind,payload FROM request_events ORDER BY event_id").fetchall()
+    responses = [json.loads(row["payload"]) for row in events if row["kind"] == "llm.response"]
+    assert json.loads(responses[0]["body"])["choices"][0]["message"]["tool_calls"][1] == malformed
+    outbound = [json.loads(row["payload"]) for row in events if row["kind"] == "llm.request"]
+    assert "message_normalizations" not in outbound[0]
+    assert outbound[1]["message_normalizations"] == [{
+        "message_index": 1, "tool_call_index": 1, "tool_call_id": "call_bad", "field": "function.name",
+        "original_present": "name" in function, "original_value": function.get("name"),
+        "wire_value": "invalid_tool_call",
+    }]
+    assert all(request["tools"][0]["function"]["name"] == "web_search" for request in requests)
+    conn.close()
+
+
 async def test_raw_collection_does_not_read_gold_for_scoring(monkeypatch):
     config = settings(SCORE_ANSWERS=False, REACT_REFLECTION_PROTOCOL=False).model_copy(
         update={"TAVILY_MAX_RESULTS": 5, "REACT_MAX_SEARCH_CALLS": 4})
@@ -852,3 +914,144 @@ async def test_quota_unknown_limit_cannot_replace_confirmed_snapshot(monkeypatch
         with pytest.raises(CollectionBlockedError):
             await collect_forecast_panel.query_search_quota(["key-a"])
         assert route.call_count == 1
+
+
+@pytest.mark.parametrize("searches_before,error_count,fallback", [(0, 1, False), (4, 1, False), (0, 6, True)])
+@respx.mock
+async def test_generated_tool_error_consumes_round_and_preserves_http_failure(
+        tmp_path, monkeypatch, searches_before, error_count, fallback):
+    config = settings(SCORE_ANSWERS=False, WRITE_REQUEST_AUDIT=True, WRITE_MESSAGES_TRACE=True,
+        REACT_REFLECTION_PROTOCOL=False, REACT_MAX_STEPS=6, REACT_MAX_SEARCH_CALLS=[4],
+        REACT_MIN_SEARCH_CALLS=0, REACT_MAX_NUDGES=0, REACT_FINAL_ANSWER_RETRY=fallback,
+        LLM_BASE_URL="https://provider.test/v1").model_copy(
+            update={"TAVILY_MAX_RESULTS": 5, "REACT_MAX_SEARCH_CALLS": 4})
+    error = {"error": {"type": "invalid_request_error", "code": "tool_use_failed", "message":
+        "Tool choice is none, but model called a tool" if searches_before else
+        "Tool call validation failed: parameters for tool web_search did not match schema: missing properties: 'query'"}}
+    requests = []
+    def respond(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        if len(requests) <= searches_before:
+            reply = _success_body()
+            reply["choices"][0].update(message=_tool_msg(str(len(requests)), "historical evidence"), finish_reason="tool_calls")
+            return httpx.Response(200, json=reply)
+        if searches_before:
+            assert "tools" not in body
+        if len(requests) <= searches_before + error_count:
+            return httpx.Response(400, json=error)
+        assert any(m["role"] == "user" and '"error":' in m["content"] for m in body["messages"])
+        return httpx.Response(200, json=_success_body())
+    model = respx.post("https://provider.test/v1/chat/completions").mock(side_effect=respond)
+    search = respx.post("https://api.tavily.com/search").respond(200, json={"results": []})
+    monkeypatch.setattr(react, "llm_chat", llm.chat)
+    monkeypatch.setattr(react, "parse_gt", lambda _: pytest.fail("must not score"))
+    conn = db.connect(tmp_path / "tool-errors.db")
+    db.init_schema(conn, 1)
+    async with AsyncOpenAI(api_key="test-key", base_url=config.LLM_BASE_URL, max_retries=0) as client:
+        monkeypatch.setattr(llm, "get_client", lambda _: client)
+        with db.capture_requests(conn, settings=config, run_id="r", model="test-arm", question_id="q", sample_idx=0):
+            result = await react.run_react(_yes_no_question(), model="test-arm", sample_idx=0,
+                settings=config, templates=DEFAULT_PROMPT_TEMPLATES, run_id="r")
+    exhausted = error_count == 6
+    assert result.error == ("tool_use_failed" if exhausted else None)
+    assert model.call_count == result.react_steps == min(6, searches_before + error_count + 1)
+    assert result.final_answer_retry_used == 0 and result.correct is None
+    assert search.call_count == result.tool_calls_count == searches_before
+    metrics = json.loads(result.step_metrics)
+    failures = [m for m in metrics if m.get("error") == "tool_use_failed"]
+    assert len(failures) == error_count
+    assert all(m["prompt"] is None and m["completion"] is None and not m["usage_reported"] for m in failures)
+    events = conn.execute("SELECT kind,request_id,payload FROM request_events ORDER BY event_id").fetchall()
+    errors = [e for e in events if e["kind"] == "llm.error"]
+    assert len(errors) == error_count
+    assert {e["request_id"] for e in errors} == {m["request_id"] for m in failures}
+    assert all(json.loads(e["payload"])["status"] == 400 and json.loads(json.loads(e["payload"])["body"]) == error for e in errors)
+    trace = json.loads(result.messages_trace)
+    assert sum(m["role"] == "assistant" for m in trace) == searches_before + (not exhausted)
+    assert not exhausted or result.final_answer_raw == ""
+    conn.close()
+
+
+@pytest.mark.parametrize("defer", [False, True])
+async def test_tool_failure_deferral_continues_other_slots_without_marking_success(tmp_path, monkeypatch, defer):
+    config = settings(SAMPLING_N=2, SCORE_ANSWERS=False, REQUIRE_HEALTHY_RETRIEVAL=True,
+        COLLECTION_DEFER_TOOL_FAILURES=defer, COLLECTION_DRAIN_ON_ERROR=True,
+        LLM_MAX_CONCURRENCY=1, DB_COMMIT_BATCH=1)
+    conn = db.connect(tmp_path / "deferred.db")
+    db.init_schema(conn, 2)
+    q = _yes_no_question()
+    conn.execute("INSERT INTO questions (id, choice_type, question_type, event, options, answer, end_time, imported_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (q.id, q.choice_type, q.question_type, q.event, q.options, q.answer, q.end_time, db.utcnow_iso()))
+    calls = []
+    async def generate(task, **kwargs):
+        calls.append(task.sample_idx)
+        return runner._error_row(task.question, task.sample_idx, "tool_use_failed" if task.sample_idx == 0 else None)
+    monkeypatch.setattr(runner, "_run_task_with_retry", generate)
+    stats = await runner.run(settings=config, filters=QFilter(), questions=[q], templates={}, run_id="r", conns={"test-arm": conn})
+    assert stats.aborted is not defer
+    assert stats.deferred == 1
+    assert calls == ([0, 1] if defer else [0])
+    assert (q.id, 0) not in db.load_completed_samples(conn, 2, retain_model_refusals=True)
+    assert db.load_deferred_tool_failures(conn, 2) == {(q.id, 0)}
+    if defer:
+        stats = await runner.run(settings=config, filters=QFilter(), questions=[q], templates={}, run_id="r", conns={"test-arm": conn})
+        assert calls == [0, 1] and stats.planned == 0 and stats.deferred == 1 and not stats.aborted
+        assert stats.completed_preexisting == 1
+        plan = {"phase": "fixture", "runtime": {"MODELS": ["test-arm"], "SAMPLING_N": 2}, "new_sample_count": 2}
+        coverage = sample_coverage(plan, {q.id}, {("test-arm", q.id, 1): "source"}, {("test-arm", q.id, 0): {"tool_use_failed"}})
+        assert not coverage["attempts_complete"] and coverage["failed"] == 1 and coverage["collected"] == 1
+    conn.close()
+
+
+def test_tool_failure_deferral_keeps_inference_hash_and_requires_audit():
+    config = settings()
+    deferred = settings(COLLECTION_DEFER_TOOL_FAILURES=True)
+    assert db.snapshot_settings(deferred)["COLLECTION_DEFER_TOOL_FAILURES"] is True
+    assert db.compute_collection_contract_hash(db.snapshot_settings(config)) == db.compute_collection_contract_hash(db.snapshot_settings(deferred))
+    with pytest.raises(ValueError, match="requires WRITE_REQUEST_AUDIT"):
+        settings(COLLECTION_DEFER_TOOL_FAILURES=True, WRITE_REQUEST_AUDIT=False)
+
+
+@pytest.mark.parametrize("virtual", [False, True])
+async def test_paused_profile_keeps_pending_slots_and_can_resume(tmp_path, monkeypatch, virtual):
+    config=settings(SAMPLING_N=1, SCORE_ANSWERS=False, COLLECTION_PAUSED_PROFILES=["test-arm"])
+    slug="test-arm::r5::c4" if virtual else "test-arm"
+    config=config.model_copy(update={"MODELS":[slug]})
+    conn=db.connect(tmp_path / "paused.db");db.init_schema(conn,1)
+    q=_yes_no_question()
+    conn.execute("INSERT INTO questions (id,choice_type,question_type,event,options,answer,end_time,imported_at) VALUES (?,?,?,?,?,?,?,?)",
+        (q.id,q.choice_type,q.question_type,q.event,q.options,q.answer,q.end_time,db.utcnow_iso()))
+    calls=[]
+    async def generate(task, **kwargs):
+        calls.append(task.model)
+        return runner._error_row(task.question,task.sample_idx,None)
+    monkeypatch.setattr(runner,"_run_task_with_retry",generate)
+    stats=await runner.run(settings=config,filters=QFilter(),questions=[q],templates={},run_id="r",conns={slug:conn})
+    assert not calls and stats.planned==0 and stats.deferred==1 and stats.completed_preexisting==0
+    assert not db.load_completed_samples(conn,1)
+    config=config.model_copy(update={"COLLECTION_PAUSED_PROFILES":[]})
+    stats=await runner.run(settings=config,filters=QFilter(),questions=[q],templates={},run_id="r",conns={slug:conn})
+    assert calls==[slug] and stats.deferred==0 and db.load_completed_samples(conn,1)=={(q.id,0)}
+    conn.close()
+
+
+def test_profile_pause_is_dispatch_only_and_validates_names():
+    original=db.snapshot_settings(settings())
+    paused=db.snapshot_settings(settings(COLLECTION_PAUSED_PROFILES=["test-arm"]))
+    assert paused["COLLECTION_PAUSED_PROFILES"]==["test-arm"]
+    assert db.compute_collection_contract_hash(original)==db.compute_collection_contract_hash(paused)
+    for names, reason in [(["other"],"declared in MODELS"),(["test-arm","test-arm"],"unique")]:
+        with pytest.raises(ValueError,match=reason):settings(COLLECTION_PAUSED_PROFILES=names)
+
+
+async def test_batch_dispatch_pause_stays_incomplete(monkeypatch):
+    plan={"phase":"continuation","runtime":{"MODELS":["held","done"],"SAMPLING_N":3,
+        "MODEL_QUESTION_IDS":{"held":["q"],"done":["q"]},"COLLECTION_RETAIN_MODEL_REFUSALS":True,
+        "COLLECTION_PAUSED_PROFILES":["held"]}}
+    monkeypatch.setattr(collect_forecast_panel,"status",lambda _:{"profiles":{
+        "held":{"completed":1,"refusals":0},"done":{"completed":2,"refusals":1}},"refusals":1})
+    monkeypatch.setattr(collect_forecast_panel,"write_json",lambda *args:None)
+    monkeypatch.setattr(collect_forecast_panel.evaluation,"_run_async",lambda *args,**kwargs:pytest.fail("must not dispatch held profile"))
+    assert await collect_forecast_panel.dispatch_batches(plan,{})==0
+    assert plan["status"]=="pending_paused_profiles" and plan["paused_pending"]==2

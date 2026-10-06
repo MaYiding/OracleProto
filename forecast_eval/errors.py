@@ -15,6 +15,7 @@ class ErrorKind(StrEnum):
     SERVER_5XX = "server_5xx"
     AUTH = "auth"
     BAD_REQUEST = "bad_request"
+    TOOL_USE_FAILED = "tool_use_failed"
     CONTENT_POLICY = "content_policy"
     UNKNOWN = "unknown"
 
@@ -25,6 +26,14 @@ class AuthError(Exception):
     Runner stops scheduling and exits with a non-zero status. Its collection
     policy determines whether samples already started finish or are cancelled.
     """
+
+
+class ToolGenerationError(Exception):
+    """The provider rejected generated tool output without returning a completion."""
+
+    def __init__(self, message: str, request_id: str | None = None):
+        super().__init__(message)
+        self.request_id = request_id
 
 
 class CollectionBlockedError(Exception):
@@ -95,6 +104,27 @@ def _body_matches(exc: BaseException, needles: tuple[str, ...]) -> bool:
     return any(n in body for n in needles)
 
 
+def tool_generation_message(exc: BaseException) -> str | None:
+    if _status_code(exc) != 400:
+        return None
+    try:
+        body = json.loads(_error_body(exc))
+    except (ValueError, TypeError):
+        return None
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict) or error.get("code") != "tool_use_failed":
+        return None
+    message = error.get("message")
+    if not isinstance(message, str):
+        return None
+    lower = message.lower()
+    if (lower.startswith("tool choice is none, but model called a tool")
+            or (lower.startswith("tool call validation failed:")
+                and "parameters for tool " in lower and "did not match schema" in lower)):
+        return message
+    return None
+
+
 def classify(exc: BaseException) -> ErrorKind:
     """Map an outgoing-HTTP exception to a coarse ErrorKind for retry decisions.
 
@@ -102,6 +132,8 @@ def classify(exc: BaseException) -> ErrorKind:
     connection/timeout wrappers. A transport retry keeps the current model
     context, including search results already obtained for this sample.
     """
+    if isinstance(exc, ToolGenerationError):
+        return ErrorKind.TOOL_USE_FAILED
     if isinstance(
         exc,
         (
@@ -135,6 +167,8 @@ def classify(exc: BaseException) -> ErrorKind:
             # Spec llm-integration §"Content policy: no retry" pins priority.
             if _body_matches(exc, CONTENT_POLICY_NEEDLES):
                 return ErrorKind.CONTENT_POLICY
+            if tool_generation_message(exc) is not None:
+                return ErrorKind.TOOL_USE_FAILED
             if _body_matches(exc, ("model_not_found", "invalid_request", "invalid request", "invalid model")):
                 return ErrorKind.BAD_REQUEST
             return ErrorKind.BAD_REQUEST

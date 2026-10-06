@@ -11,6 +11,7 @@ from loguru import logger
 
 from .config import Settings
 from .db import utcnow_iso
+from .errors import ErrorKind, ToolGenerationError
 from .llm import ChatResponse, chat as llm_chat
 from .parser import Belief, is_correct, parse_answer, parse_belief, parse_gt
 from .prompts import (
@@ -230,6 +231,8 @@ async def run_react(
     # carries the same status header for that turn.
     pending_continuation = False
     last_resp: ChatResponse | None = None
+    pending_tool_failure = False
+    had_tool_failure = False
     # `effective_max_search_calls` is what the LLM-facing prompts should
     # advertise as the search budget: 0 when web_search is disabled (so the
     # status header reads "web_search disabled" instead of "0/0 used"), the
@@ -355,12 +358,37 @@ async def run_react(
             tools_for_this_step = tool_schemas
 
         t_step_start = time.monotonic()
-        resp = await llm_chat(
-            model=model,
-            messages=messages,
-            settings=settings,
-            tools=tools_for_this_step,
-        )
+        try:
+            resp = await llm_chat(
+                model=model,
+                messages=messages,
+                settings=settings,
+                tools=tools_for_this_step,
+            )
+        except ToolGenerationError as exc:
+            pending_tool_failure = had_tool_failure = True
+            last_resp = None
+            beliefs_per_step.append(None)
+            step_metrics.append({
+                "step": step, "prompt": None, "completion": None, "reasoning": None,
+                "usage_reported": False, "latency_ms": int((time.monotonic() - t_step_start) * 1000),
+                "finish_reason": None, "n_tool_calls": None, "belief": None,
+                "error": str(ErrorKind.TOOL_USE_FAILED), "request_id": exc.request_id,
+            })
+            # No assistant message or tool-call ID was returned by the provider.
+            # Feedback therefore uses a user turn; no tool arguments are inferred.
+            feedback = tool_error_message("", str(exc), status=build_tool_error_status(
+                current_step=steps_executed, max_steps=settings.REACT_MAX_STEPS,
+                searches_done=len(search_calls), max_search_calls=effective_max_search_calls,
+                next_step_strips_tools=(
+                    not tools_for_this_step
+                    or (settings.REACT_FORCE_FINAL_ANSWER_NEAR_LIMIT
+                        and settings.REACT_MAX_STEPS - steps_executed == 1)
+                ),
+            ))
+            messages.append({"role": "user", "content": feedback["content"]})
+            continue
+        pending_tool_failure = False
         t_step_ms = int((time.monotonic() - t_step_start) * 1000)
         assistant_msg = resp.message
         # Belief parsing is independent of the boxed-answer path: a failed
@@ -512,7 +540,7 @@ async def run_react(
     # different from "nudge to keep searching"); we DO add the call to
     # `react_steps` and `step_metrics` so the trace stays auditable.
     final_answer_retry_used = 0
-    if final_raw == "" and settings.REACT_FINAL_ANSWER_RETRY:
+    if final_raw == "" and settings.REACT_FINAL_ANSWER_RETRY and not had_tool_failure:
         messages.append(
             {
                 "role": "user",
@@ -580,7 +608,7 @@ async def run_react(
         user_prompt=user_prompt,
         messages_trace=json.dumps(messages, ensure_ascii=False) if settings.WRITE_MESSAGES_TRACE else None,
         search_calls=json.dumps(search_calls, ensure_ascii=False),
-        error=None,
+        error=str(ErrorKind.TOOL_USE_FAILED) if pending_tool_failure else None,
         created_at=utcnow_iso(),
         # Final-state envelope fields are taken from the LAST llm.chat response
         # so the recorded `finish_reason` reflects how the loop actually

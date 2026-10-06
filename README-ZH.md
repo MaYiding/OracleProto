@@ -1,59 +1,46 @@
 <div align="center">
+<img src="static/images/OracleProto_Logo_Horizontal.svg" alt="OracleProto" width="360">
 
-<img src="static/images/OracleProto_Logo_Horizontal.png" alt="OracleProto Logo" width="100%">
+**对 LLM 原生预测能力进行基准评测的可复现框架**
 
-<em>通过知识截止与时间掩码，对 LLM 原生预测能力进行基准评测的可复现框架</em>
+知识截止 · 时间掩码 · 可审计检索
 
+[![CI](https://github.com/MaYiding/OracleProto/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MaYiding/OracleProto/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/Python-3.12-42558c?style=flat-square)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-6752a8?style=flat-square)](LICENSE)
+
+[排行榜](https://oracleproto.com) · [数据集](https://huggingface.co/datasets/MaYiding/OracleProto) · [论文](https://arxiv.org/abs/2605.03762) · [English](README.md)
+
+<img src="static/images/benchmark-overview.svg" alt="300 道题、528 分、三次重复、27 个配置" width="100%">
 </div>
 
-$`\Large \text{预测} = \text{信息搜集} \times \text{证据整合} \times \text{情势研判} \times \text{行动决策}`$
+## 在声明的信息边界内评测预测能力
 
-<div align="center">
+OracleProto 将已解析事件重构为预测题目，声明模型知识截止，并限制检索的时间范围。检索内容经过独立泄漏检测器，供应商原生浏览被禁用，运行记录保留提示词、答案和资源用量，以便核查结果。`event` 与 `end_time` 定位事件实例，检索截止仍在工具层注入。
 
-传统基准考的是“你记得住答案吗”
-<br>
-OracleProto 问的是“你能预测未来吗”
+公开的论文评测试卷包含 **300 道题**，解析日期为 **2026-03-12 至 2026-09-21**。完整评测涵盖 **27 个模型配置**，每题 **三次重复**，共 **24,300 次作答**。数据集配套提供[结果 CSV](data/results/score_summary.csv)和[评分契约](data/results/benchmark_manifest.json)。
 
-<b>愿每一次预测都可复现，愿 AI 真正走向辅助决策</b>
-<br>
-服务于每一个人对美好生活的判断与选择
+| 题型 | 题数 | 单题分值 | 满分 |
+| --- | ---: | ---: | ---: |
+| 判断题 | 100 | 1 | 100 |
+| 具名二选一 | 9 | 1 | 9 |
+| 多选一 | 154 | 2 | 308 |
+| 多选多 | 37 | 3 | 111 |
+| **合计** | **300** | | **528** |
 
-![GitHub License](https://img.shields.io/badge/License-MIT-brightgreen?style=for-the-badge)
-![Python Version](https://img.shields.io/badge/Python-3.12-brightgreen?style=for-the-badge)
+**Score 是核心指标。** 要求精确答案的题目按对错给全分或零分，多选多按选项 F1 给部分分。正确率、选项错误、重复作答和推理成本用于解释 Score。[在线排行榜](https://oracleproto.com)展示完整结果。
 
-[English](./README.md) | [中文文档](./README-ZH.md) | [Hugging Face](https://huggingface.co/datasets/MaYiding/OracleProto)
+最终检索内容审计采用 **GPT 6.1 Sol 核验 10,000 条结果、标注 137 条泄漏的结论，即 1.37%**。人工核验确认 137 条正例均泄漏，并在抽查的 1,000 条负例中未发现泄漏。该审计针对检索内容，不能据此确认模型的训练数据边界。
 
-查看我们的论文：[arXiv](http://arxiv.org/abs/2605.03762)
+<details>
+<summary>查看框架图</summary>
 
-访问我们的排行榜：[oracleproto.com](https://oracleproto.com)
+<img src="static/images/Framework.png" alt="OracleProto 信息边界与评测流程" width="100%">
 
-</div>
+</details>
 
 ---
 
-## 概述
-
-- **背景与挑战：** LLM预测评估面临两难：实时测试**易失效**，回顾测试存在**数据泄露**。提示词无法建立真实的**知识边界**。
-
-- **架构和方法：** OracleProto 框架结合模型知识截止与时间遮蔽，将历史事件严谨重构为**具有时间边界的可复现的预测样本**。
-
-- **Prompt 渲染：** 每条题目把 `event` 与 `end_time` 分开给模型。`end_time` 是定位事件实例的 resolution date；检索 cutoff $`\chi_i`$ 仍只在工具层注入。
-
-- **实验的效果：** 测试 6 种主流 LLM 表明，OracleProto 能区分模型的预测质量、稳定性与成本效益，将泄露率降至 1%，为**模型对比、监督微调和强化学习**提供了受控的信号源。
-
-<div align="center">
-
-<img src="static/images/Framework.png" alt="OracleProto 框架图" width="100%">
-
-OracleProto 框架图
-
-<img src="static/images/preview/2-ZH.png" alt="OracleProto 在线排行榜一览" width="100%">
-
-OracleProto 在线排行榜速览
-
-</div>
-
----
 ## 1. 代码结构
 
 ```
@@ -122,9 +109,29 @@ python evaluation.py
 
 ## 3. 接入自有数据集
 
-仓库随附的 `forecast_eval_set_example.db` 是由 `futurex-ai/Futurex-Past` 生成的 SQLite 源库。它只有一张 `test_cases` 表，包含七列：`id`、`choice_type`、`question_type`、`event`、`options`、`answer` 与 `end_time`。该表含 300 道精选 Level 1/2 题，日期为 2026-03-19 至 2026-09-22，包括 130 道二选一（是否题或两个具名选项）、130 道至少三个选项的多选一，以及 40 道多选多。体育和电竞合计 54 道，占 18%。
+仓库随附的 `forecast_eval_set_example.db` 是由 `futurex-ai/Futurex-Past` 生成的 SQLite 源库。它只有一张 `test_cases` 表，包含七列：`id`、`choice_type`、`question_type`、`event`、`options`、`answer` 与 `end_time`。该表含 300 道精选 Level 1/2 题，日期为 2026-03-19 至 2026-09-22，包括 104 道二选一（97 道判断题、7 道具名二选一）、156 道至少三个选项的多选一，以及 40 道多选多。
 
 接入其他语料时，先创建同样七列的 SQLite 表，再在 `.env` 中指向 `SOURCE_DB` 与 `SOURCE_TABLE`。源库不需要 `dataset_metadata`；缺少该表时，loader 使用 `forecast_eval.prompts.DEFAULT_PROMPT_TEMPLATES`。只有当数据集需要携带自己的 11 个 prompt-template 键时，才添加 `dataset_metadata.features_json.prompt_reconstruction`。
+
+### 复现论文评测
+
+仓库示例库和论文试卷是两套不同的 300 题题库。复现论文结果时，下载固定的 [Hugging Face SQLite 发布文件](https://huggingface.co/datasets/MaYiding/OracleProto/resolve/main/forecast_eval_set_example.db)，并使用其中保存的共用提示词：
+
+```bash
+curl -L https://huggingface.co/datasets/MaYiding/OracleProto/resolve/main/forecast_eval_set_example.db -o oracleproto_300.db
+```
+
+```dotenv
+SOURCE_DB=./oracleproto_300.db
+SOURCE_TABLE=test_cases
+PROMPT_TEMPLATE_STYLE=shared
+SAMPLING_N=3
+REACT_MAX_STEPS=6
+REACT_MAX_SEARCH_CALLS=4
+TAVILY_MAX_RESULTS=5
+```
+
+发布清单固定源库 SHA-256 和评分契约。显式思考设置与供应商默认配置分别保存，High 路由和思考开关也不代表相同的供应商预算。共用提示词中的严格答案指令保持采集时原文，公开评分器对多选多采用 F1 部分分。
 
 ---
 
@@ -150,7 +157,7 @@ python -B -m forecast_eval.analysis runs/{run_id}
 
 分批采集的统一入口是 `python -B -m forecast_eval.analysis runs/collection_300/catalog.json --profiles PROFILE_ID ...`。先由采集会话刷新 catalog，再明确选定已完成的配置；catalog 可能同时列出尚未开始的 reasoning 配置。评分会校验题库与观测导出的哈希，保留参考、续跑、补录和过滤分层。结果写入 `runs/collection_300/analysis/score/`。
 
-`score_report.md` 与 `score_summary.csv` 报告共同题目上的模型表现。`score_by_type.csv` 列出四类题型；`selection_diagnostics.csv` 区分错选、漏选和替换；`score_by_trial.csv` 及 pass/vote 列描述重复作答。指标取舍与研究依据见 [DESIGN §4](DESIGN-ZH.md#4-分层评测)，输出字段见 [FRAME §9](FRAME-ZH.md#9-指标)。
+`score_report.md` 与 `score_summary.csv` 报告共同题目上的模型表现。`score_by_type.csv` 列出四类题型；`selection_diagnostics.csv` 区分错选、漏选和替换；`score_by_trial.csv` 及 pass/vote 列描述重复作答。指标定义见[评分契约](data/results/benchmark_manifest.json)，输出字段对应[报告实现](forecast_eval/analysis/score_report.py)。
 
 即使 `correct` 为 NULL，评分器也会读取已存答案重新判分，不回写原始 DB。声明的参考 DB 按模型、题目、采样序号联合读取，并检查冲突。缺样本或基础设施失败会以退出码 2 阻止正式评分，同时生成覆盖报告。`--allow-incomplete` 允许查看诊断，但受影响的分数仍留空。模型拒绝与无效答案计零分；因 cutoff 排除的题目不计入。固定评分契约、来源配置哈希、观测与实现指纹写入 `scoring_meta.json`。
 
@@ -188,6 +195,9 @@ python -B -m forecast_eval.analysis runs/{run_id}
 
 ---
 
+<details>
+<summary>高级采集设置</summary>
+
 ## 使用固定思考配置采集原始预测
 
 `MODEL_PROFILES` 将实验配置 ID 映射到供应商模型 ID 与明确的思考参数；`MODELS` 列出实验配置 ID。论文采集预算固定为 `TAVILY_MAX_RESULTS=5`、`REACT_MAX_SEARCH_CALLS=4`、`REACT_MAX_STEPS=6`、`SAMPLING_N=3`。供应商默认模式不声明 effort，与显式 `none` 或 `high` 配置分别保存。
@@ -206,7 +216,11 @@ python -B -m forecast_eval.analysis runs/{run_id}
 
 收到委派结果后，先核对发送方校验清单并确认采集已停止，再将 `delegated_results.json` 中对应项设为 `verified_return`，填写以项目相对路径为键的 `returned_artifacts` SHA-256 映射。catalog 核对固定任务、执行快照、原始日志和推理契约后，将回传运行作为独立来源收录。未经核对的回传仍记为待接收。
 
-`COLLECTION_RETAIN_MODEL_REFUSALS=true` 留存预测供应商的内容拒绝，并继续其他样本槽。该开关要求启用请求审计，恢复时跳过已留存的拒绝。catalog 将拒绝与预测分开统计；其他终止性错误仍停止严格采集。
+`COLLECTION_RETAIN_MODEL_REFUSALS=true` 留存预测供应商的内容拒绝，并继续其他样本槽。该开关要求启用请求审计，恢复时跳过已留存的拒绝。catalog 将拒绝与预测分开统计；除启用生成工具失败延后处理外，其他终止性错误仍停止严格采集。
+
+`COLLECTION_PAUSED_PROFILES` 列出需要暂缓的已授权配置，其他配置可继续执行。暂缓配置的剩余槽位保留为待完成，等待明确恢复。在采集计划的 `runtime` 中设置该列表。
+
+`COLLECTION_DEFER_TOOL_FAILURES=true` 允许在模型因供应商拒绝其生成的工具调用而耗尽固定轮数后，继续采集其他槽位。失败槽位保留请求证据并保持待处理状态，既不计为完成，也不自动重试。该选项要求请求审计。搜索、鉴权、额度及其他服务故障仍停止严格采集。
 
 `LEAK_DETECTOR_RESPONSE_FORMAT=json_object` 向支持该选项的过滤模型接口请求有效 JSON。`python scripts/catalog_collection.py` 在 `runs/collection_300/catalog.json` 中关联参考样本和采集样本，按一致的字段名导出观测记录，保留来源分层和原始值，不计算评分。其中的覆盖清单标识每个尚未完成的模型、题目和采样序号组合。观测导出采用 gzip 无损压缩。
 
@@ -217,3 +231,5 @@ python -B -m forecast_eval.analysis runs/{run_id}
 `python scripts/collect_forecast_panel.py plan --phase repair` 为参考数据中已记录的失败准备独立补录。`MODEL_SAMPLE_INDICES` 将每题限制到失败样本槽，保留已完成样本和声明的采样次数。补录运行共用采集锁，在当前采集器释放锁后启动。
 
 保留原题的面板流程依次使用 `python scripts/prepare_collection.py`、`python scripts/collect_forecast_panel.py plan`、`python scripts/probe_collection.py` 与 `python scripts/collect_forecast_panel.py run`。本地计划和来源清单位于 `runs/collection_300/`；`python scripts/collect_forecast_panel.py status` 只报告采集数量，不评分。API 凭据保存在 `.env`。
+
+</details>
